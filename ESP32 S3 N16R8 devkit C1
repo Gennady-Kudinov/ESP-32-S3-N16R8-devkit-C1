@@ -2,7 +2,7 @@
 // ************* Gennady **************
 // Telegram   @pa_tuner_1000wt
 // https://rutube.ru/channel/23993242/videos/
-// Max   LDMOS PA CLUB//************** RX3PX ****************
+// Max   LDMOS PA CLUB
 
 #include <WiFi.h>
 #include <WebServer.h>
