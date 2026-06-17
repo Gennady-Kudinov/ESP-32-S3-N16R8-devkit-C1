@@ -10,3 +10,11 @@
 <img width="694" height="534" alt="Снимок экрана — 2026-06-17 в 12 51 31" src="https://github.com/user-attachments/assets/d36fc4cb-622e-4bbe-900b-370baebb60f5" />
 <img width="704" height="790" alt="Снимок экрана — 2026-06-17 в 12 52 04" src="https://github.com/user-attachments/assets/3553386e-4f71-458c-b294-24475fc46e55" />
 
+<img width="684" height="835" alt="Снимок экрана — 2026-06-17 в 13 07 29" src="https://github.com/user-attachments/assets/2c334474-f1d9-4e1e-9c06-7e5cbbcf1547" />
+
+<img width="694" height="554" alt="Снимок экрана — 2026-06-17 в 13 08 35" src="https://github.com/user-attachments/assets/9a3d0efa-351f-4032-a0ee-ba5a912292e7" />
+
+<img width="693" height="819" alt="Снимок экрана — 2026-06-17 в 13 09 04" src="https://github.com/user-attachments/assets/12f8b5b2-ddd0-4a1a-b7bc-39758a7b1fae" />
+
+
+
