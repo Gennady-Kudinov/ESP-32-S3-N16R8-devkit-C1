@@ -1,0 +1,2287 @@
+//************** RX3PX ****************
+// ************* Gennady **************
+// Telegram   @pa_tuner_1000wt
+// https://rutube.ru/channel/23993242/videos/
+// Max   LDMOS PA CLUB//************** RX3PX ****************
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h>           // СОХРАНЕНО: Стабильный модуль Native Wi-Fi OTA (СТРОГИЙ ЗАПРЕТ НА ПРАВКИ)
+#include <Wire.h>             // Аппаратная шина I2C для мультиплексора и внешнего АЦП
+
+// --- СТРОГО ОБНОВЛЕНО: ДИСПЛЕЙ 1602 ПОДКЛЮЧЕН ПАРАЛЛЕЛЬНО НА ОСНОВНУЮ ШИНУ I2C ---
+#include <LiquidCrystal_I2C.h>
+// Объявляем объект дисплея. 0x27 - адрес, 16 символов, 2 логические строки
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+#include <Preferences.h>      // Библиотека для работы с постоянной Flash-памятью
+#include "driver/pulse_cnt.h" // СОХРАНЕНО СТРОГО В ЭТАЛОНЕ: Современный драйвер PCNT частотомера
+#include <time.h>             // Встроенная системная библиотека времени (POSIX RTC)
+
+// Библиотеки для работы с датчиком температуры DS18B20 по протоколу 1-Wire
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ПРОТОТИПЫ И ОПЕРЕЖАЮЩИЕ ОБЪЯВЛЕНИЯ ДЛЯ ЛИНКЕРА
+void selectI2CChannel(uint8_t channel);
+void writeRegister595(uint32_t mask);
+void checkProtectionTrips();
+void autoSelectBand(double freqHz);
+void applyAntennaHardware(int antId);
+void autoSelectAntennaForBand(int bandIdx);
+void calculateRfParameters(float rawVoltFwd, float rawVoltRef);
+void processTwoPointCalibration();
+extern float currentVoltFwdCalibrationSnapshot;
+
+// Прототипы монолитных Flash-массивов PROGMEM страницы Icom
+extern const char HTML_STYLES[] PROGMEM;
+extern const char HTML_SCRIPTS[] PROGMEM;
+extern const char HTML_BODY_NEW[] PROGMEM;
+
+// --- ВНЕДРЕНО: АППАРАТНЫЕ АДРЕСА РЕГИСТРОВ MCP23017 ДЛЯ ПОРТОВ А7 И В0 ---
+#define MCP_ADDR    0x20  // Жесткий I2C адрес микросхемы (А0, А1, А2 на земле)
+#define IODIRA      0x00  // Направление портов Порта А (1=вход, 0=выход)
+#define IODIRB      0x01  // Направление портов Порта В (1=вход, 0=выход)
+#define GPPUB       0x0D  // Подтягивающие Pull-Up резисторы Порта В
+#define GPIOA_REG   0x12  // Регистр физического состояния (записи/чтения) Порта А
+#define GPIOB_REG   0x13  // Регистр физического состояния (записи/чтения) Порта В
+
+// Настройки Wi-Fi сети
+// Динамические переменные Wi-Fi сети для чтения и записи во Flash
+String wifi_ssid_live = "Dachnaja 8";
+String wifi_pass_live = "8101966G";
+
+// Настройка статического IP-адреса усилителя
+IPAddress local_IP(192, 168, 0, 123);
+IPAddress gateway(192, 168, 0, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+WebServer server(80);
+Preferences prefs;             
+
+#define PIN_ADC_FWD     1   // Прямая мощность Po (GPIO 1)
+#define PIN_ADC_REF     5   // Отраженная мощность Pr (GPIO 5)
+#define PIN_ADC_PIN    11   // Мощность раскачки P IN (GPIO 11)
+
+#define PIN_I2C_SDA     21  // GPIO 21 ➔ SDA
+#define PIN_I2C_SCL     47  // GPIO 47 ➔ SCL
+#define PIN_DS18B20     6   // Датчик DS18B20 на GPIO 6
+
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature tempSensor(&oneWire);
+
+#define PIN_595_DATA    7   // DS пин
+#define PIN_595_CLOCK   8   // SHCP пин
+#define PIN_595_LATCH   9   // STCP пин
+
+#define FREQ_INPUT_PIN 17   
+const int PRESCALER = 32;    
+const unsigned long GATE_TIME_MS = 10; 
+
+uint32_t final_frequency = 0;          
+double last_calculated_frequency = 0.0; 
+float calibration_factor = 1.0000f;    
+
+String current_band_name = "---";      
+
+// Переменные автомата состояний секвенсора
+unsigned long sequencer_timer = 0;
+int sequencer_state = 0; // 0 = RX режим сна, 1..4 = шаги включения TX, 5..8 = шаги выключения RX
+
+// Глобальная 32-битная маска для 4-х корпусов 74HC595 (Сохраняет реле ФНЧ)
+uint32_t current_32bit_lpf_mask = 0x00000000; 
+
+// Битовые маски конкретных исполнительных реле в цепочке из 4-х чипов
+#define BIT_RF_OUTPUT_RELAY   (1UL << 7) // 7-я физическая ножка (Q7) 1-го чипа 74HC595
+// --- СТРОГО ПО ЖЕЛЕЗНОЙ СХЕМЕ: БИТОВЫЕ МАСКИ КАНАЛОВ УПРАВЛЕНИЯ 4-ГО ЧИПА 74HC595 ---
+#define BIT_ANTENNA_1         (1UL << 27) // Физическая ножка 3 (Q3) 4-го чипа 74HC595
+#define BIT_ANTENNA_2         (1UL << 28) // Физическая ножка 4 (Q4) 4-го чипа 74HC595
+#define BIT_ANTENNA_3         (1UL << 29) // Физическая ножка 5 (Q5) 4-го чипа 74HC595
+#define BIT_ANTENNA_4         (1UL << 30) // Физическая ножка 6 (Q6) 4-го чипа 74HC595
+#define BIT_RF_INPUT_RELAY    (1UL << 31) // Физическая ножка 7 (Q7) 4-го чипа 74HC595 (Секвенсор)
+
+
+float ext_voltage_vd = 0.00f;          
+float ext_current_id = 0.0f;           
+float ext_temperature = 25.0f;         
+float wattsPin = 0.0f;                 // Входная мощность раскачки (0.0 - 100.0 Вт)
+
+float lim_id = 35.0f;       
+float lim_vd = 55.0f;       
+float lim_swr = 3.0f;       
+float lim_pin = 50.0f;      
+float lim_pout = 1200.0f;   
+float lim_pref = 100.0f;    
+float lim_lpf = 15.0f;      
+int   lim_tx_time = 10;
+int ext_protocol_type = 0; // 0=PCNT, 1=TCI, 2=WOLF, 3=CI-V, 4=YAESU, 5=KENWOOD
+int bypass_state = 0; // 0 = Обход выключен (УМ в тракте), 1 = BYPASS активен (прямой обход)
+int active_trx_id = 1; // 1 = Выбран TRX-1, 2 = Выбран TRX-2
+// СТРОГО ДОБАВЛЕНО: ID активного выхода антенного коммутатора 4-го чипа (1-4)
+int active_antenna_id = 1;
+
+// Матрица привязки антенн к диапазонам 160м–6м (индекс 0..6 → антенна 1..4)
+#define BAND_COUNT 7
+enum BandIndex : uint8_t {
+  BAND_160M = 0, BAND_80M = 1, BAND_40M = 2, BAND_20M = 3,
+  BAND_17M  = 4, BAND_10M = 5, BAND_6M  = 6
+};
+int band_antenna_map[BAND_COUNT] = {1, 1, 1, 2, 2, 3, 4};
+int current_band_index = -1;
+// СТРОГО ДОБАВЛЕНО: Глобальные флаги состояния педалей PTT для сквозной видимости в loop()
+bool ptt1_active = false;
+bool ptt2_active = false;
+// Уставки климата для плавного ШИМ вентилятора (DevKit пин 14)
+int fan_t_min  = 35;  // Температура начала вращения (30-75C)
+int fan_t_max  = 65;  // Температура максимальных оборотов (30-75C)
+int fan_pct_min = 20; // Минимальный порог старта ШИМ (10-50%)
+
+// Текущие живые обороты вентилятора для вывода на экран (0% - 100%)
+int fan_pwm_percent = 0; 
+
+int biass_state = 0; // 0 = Смещение снято (затворы заперты, 0V), 1 = BIASS активен (+3.3V)
+
+// --- ВНЕДРЕНО: ПРЕЦИЗИОННЫЕ ТАЙМИНГИ SEQUENCER MATRIX CONTROL ПО ОБРАЗЦУ ТЗ ---
+int seq_rf_out_tx = 10;  // 1. RF OUTPUT: TX Turn-On Delay (0-50 ms)
+int seq_rf_out_rx = 30;  // 2. RF OUTPUT: RX Turn-Off Delay (0-100 ms)
+int seq_bias_tx   = 25;  // 3. LDMOS BIAS: TX Bias Power-On Delay (0-100 ms)
+int seq_bias_rx   = 5;   // 4. LDMOS BIAS: RX Bias Power-Off Delay (0-50 ms)
+int seq_rf_in_tx  = 15;  // 5. RF INPUT:  TX Turn-On Delay (0-50 ms)
+int seq_rf_in_rx  = 20;  // 6. RF INPUT:  RX Turn-Off Delay (0-100 ms)
+
+float lim_temp = 60.0f;     
+
+bool is_tripped = false;          
+String trip_reason = "SYSTEM OK"; 
+
+volatile int64_t pcnt_overflow_count = 0;
+pcnt_unit_handle_t pcnt_unit = NULL;
+pcnt_channel_handle_t pcnt_chan = NULL;
+
+float wattsFwd = 0.0f;         
+float wattsRef = 0.0f;         
+float swr      = 1.00f;        
+
+float CAL_AD8307_SLOPE = 0.0250f;   
+float cal_intercepts = -84.0f;    
+#define COUPLER_ATTN 60.0f          
+
+float lastVoltPt1 = 0.0f;
+float lastVoltPt2 = 0.0f;
+
+const char* ntpServer  = "ntp1.vniiftri.ru";
+const char* ntpServer2 = "2.pool.ntp.org";
+const long  gmtOffset_sec = 10800; 
+const int   daylightOffset_sec = 0;
+
+bool IRAM_ATTR on_pcnt_overflow(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t *edata, void *user_ctx) {
+    if (edata->watch_point_value == 20000) { pcnt_overflow_count++; }
+    return false;
+}
+
+//*************************************************************
+// ************************** ЧАСТЬ 2 *************************
+//*************************************************************
+
+// Объявление и инициализация переменной фиксации АЦП
+float currentVoltFwdCalibrationSnapshot = 0.0f;
+
+/**
+ * Функция принудительного выбора активного I2C-канала на мультиплексоре PCA9548A
+ */
+void selectI2CChannel(uint8_t channel) {
+    if (channel > 7) return;
+    Wire.beginTransmission(0x70); // Базовый I2C адрес PCA9548A
+    Wire.write(1 << channel);     // Посылаем битовую маску для открытия канала
+    Wire.endTransmission();
+}
+
+// Прецизионная функция последовательной отправки 32 бит во все 4 корпуса 74HC595
+void writeRegister595(uint32_t mask) {
+    digitalWrite(PIN_595_LATCH, LOW);
+    
+    // Проталкиваем 4 байта последовательно (от старшего 4-го чипа к младшему 1-му)
+    shiftOut(PIN_595_DATA, PIN_595_CLOCK, MSBFIRST, (mask >> 24) & 0xFF); // Четвертый чип (Входное реле)
+    shiftOut(PIN_595_DATA, PIN_595_CLOCK, MSBFIRST, (mask >> 16) & 0xFF); // Третий чип
+    shiftOut(PIN_595_DATA, PIN_595_CLOCK, MSBFIRST, (mask >> 8) & 0xFF);  // Второй чип
+    shiftOut(PIN_595_DATA, PIN_595_CLOCK, MSBFIRST, mask & 0xFF);         // Первый чип (ФНЧ и Выходное реле)
+    
+    digitalWrite(PIN_595_LATCH, HIGH);
+}
+
+/**
+ * Интеллектуальное ядро защиты (Protection Monitor). Проверяет 9 триггеров по ТЗ.
+ */
+void checkProtectionTrips() {
+    if (is_tripped) return; 
+    String reason = "";
+    
+    if (ext_current_id > lim_id) {
+        reason = "OVERCURRENT Id: " + String(ext_current_id, 2) + "A / Порог: " + String(lim_id, 0) + "A";
+    }
+    else if (ext_voltage_vd > lim_vd) {
+        reason = "OVERVOLTAGE Vd: " + String(ext_voltage_vd, 1) + "V / Порог: " + String(lim_vd, 0) + "V";
+    }
+    else if (swr > lim_swr) {
+        reason = "HIGH SWR: " + String(swr, 2) + " / Порог: " + String(lim_swr, 1);
+    }
+    else if (wattsPin > lim_pin) { 
+        reason = "OVERDRIVE Pin: " + String(wattsPin, 1) + "W / Порог: " + String(lim_pin, 0) + "W";
+    }
+    else if (wattsFwd > lim_pout) {
+        reason = "OVERPOWER FWD: " + String(wattsFwd, 0) + "W / Порог: " + String(lim_pout, 0) + "W";
+    }
+    else if (wattsRef > lim_pref) {
+        reason = "HIGH REFLECTED: " + String(wattsRef, 1) + "W / Порог: " + String(lim_pref, 0) + "W";
+    }
+    else if (current_band_name == "---" && wattsFwd > 5.0f && 25.0f > lim_lpf) {
+        reason = "LPF FAULT: Неверный диапазон ФНЧ!";
+    }
+    static unsigned long txStartMillis = 0;
+    if (wattsFwd > 5.0f) { 
+        if (txStartMillis == 0) txStartMillis = millis();
+        if (lim_tx_time > 0 && (millis() - txStartMillis >= (unsigned long)lim_tx_time * 1000)) {
+            reason = "TX TIMEOUT: Превышено время несущей " + String(lim_tx_time) + " сек";
+        }
+    } else { txStartMillis = 0; }
+    
+    if (ext_temperature > lim_temp) {
+        reason = "OVERHEAT Temp: " + String(ext_temperature, 1) + "C / Порог: " + String(lim_temp, 0) + "C";
+    }
+
+    if (reason != "") {
+        is_tripped = true; trip_reason = reason;
+        digitalWrite(18, LOW); 
+        writeRegister595(0x00); 
+        Serial0.println("\n!!! EMERGENCY PROTECTION TRIP !!! Причина: " + trip_reason);
+    }
+}
+
+void applyAntennaHardware(int antId) {
+    if (antId < 1 || antId > 4) antId = 1;
+    active_antenna_id = antId;
+
+    current_32bit_lpf_mask &= ~(BIT_ANTENNA_1 | BIT_ANTENNA_2 | BIT_ANTENNA_3 | BIT_ANTENNA_4);
+    if (antId == 1) current_32bit_lpf_mask |= BIT_ANTENNA_1;
+    else if (antId == 2) current_32bit_lpf_mask |= BIT_ANTENNA_2;
+    else if (antId == 3) current_32bit_lpf_mask |= BIT_ANTENNA_3;
+    else if (antId == 4) current_32bit_lpf_mask |= BIT_ANTENNA_4;
+
+    writeRegister595(current_32bit_lpf_mask);
+}
+
+void autoSelectAntennaForBand(int bandIdx) {
+    if (bandIdx < 0 || bandIdx >= BAND_COUNT) return;
+    int targetAnt = band_antenna_map[bandIdx];
+    if (targetAnt < 1 || targetAnt > 4) targetAnt = 1;
+    if (active_antenna_id != targetAnt) {
+        applyAntennaHardware(targetAnt);
+    }
+}
+
+void autoSelectBand(double freqHz) {
+    uint8_t mask = 0x00;
+    int newBandIdx = -1;
+    
+    // СТРОГО ПО НОВОЙ АППАРАТНОЙ СХЕМЕ ПОДКЛЮЧЕНИЯ ПЕРВОГО ЧИПА 74HC595
+    if (freqHz >= 1500000.0 && freqHz <= 2500000.0) {
+        mask = 0x01; // 160м ➔ Бит 0 (Физическая ножка 15 / Q0) - РАБОТАЕТ
+        current_band_name = "160m";
+        newBandIdx = BAND_160M;
+    } 
+    else if (freqHz > 2500000.0 && freqHz <= 4500000.0) {
+        mask = 0x02; // 80м ➔ Бит 1 (Физическая ножка 1 / Q1)
+        current_band_name = "80m";
+        newBandIdx = BAND_80M;
+    } 
+    else if (freqHz > 4500000.0 && freqHz <= 9000000.0) {
+        mask = 0x04; // 40м ➔ Бит 2 (Физическая ножка 2 / Q2)
+        current_band_name = "40m";
+        newBandIdx = BAND_40M;
+    } 
+    else if (freqHz > 9000000.0 && freqHz <= 15000000.0) {
+        mask = 0x08; // 30м/20м ➔ Бит 3 (Физическая ножка 3 / Q3)
+        current_band_name = "20m/30m";
+        newBandIdx = BAND_20M;
+    } 
+    else if (freqHz > 15000000.0 && freqHz <= 22000000.0) {
+        mask = 0x10; // 17м/12м ➔ Бит 4 (Физическая ножка 4 / Q4)
+        current_band_name = "17m/12m";
+        newBandIdx = BAND_17M;
+    } 
+    else if (freqHz > 22000000.0 && freqHz <= 35000000.0) {
+        mask = 0x20; // 12м/10м ➔ Бит 5 (Физическая ножка 5 / Q5)
+        current_band_name = "12m/10m";
+        newBandIdx = BAND_10M;
+    } 
+    else if (freqHz > 35000000.0 && freqHz <= 60000000.0) {
+        mask = 0x40; // 6м ➔ Бит 6 (Физическая ножка 6 / Q6)
+        current_band_name = "6m";
+        newBandIdx = BAND_6M;
+    } 
+    else {
+        mask = 0x00;
+        current_band_name = "---";
+        newBandIdx = -1;
+    }
+
+    bool bandChanged = (newBandIdx != current_band_index);
+    current_band_index = newBandIdx;
+
+    // Ювелирно интегрируем маску ФНЧ в первый байт 32-битной цепочки, сохраняя биты реле секвенсора
+    uint32_t oldMask = current_32bit_lpf_mask;
+    current_32bit_lpf_mask = (current_32bit_lpf_mask & 0xFFFFFF00) | mask;
+    
+    if (current_32bit_lpf_mask != oldMask) { 
+        writeRegister595(current_32bit_lpf_mask); 
+    }
+
+    if (bandChanged && newBandIdx >= 0) {
+        autoSelectAntennaForBand(newBandIdx);
+    }
+}
+
+
+void calculateRfParameters(float rawVoltFwd, float rawVoltRef) {
+    if (rawVoltFwd > 0.26f) { 
+        float dbmFwdInput = ((rawVoltFwd - 0.25f) / CAL_AD8307_SLOPE) + cal_intercepts;
+        float dbmFwdTotal = dbmFwdInput + COUPLER_ATTN;
+        wattsFwd = pow(10.0f, dbmFwdTotal / 10.0f) / 1000.0f;
+    } else { wattsFwd = 0.0f; }
+    if (rawVoltRef > 0.26f && wattsFwd > 0.5f) { 
+        float dbmRefInput = ((rawVoltRef - 0.25f) / CAL_AD8307_SLOPE) + cal_intercepts;
+        float dbmRefTotal = dbmRefInput + COUPLER_ATTN;
+        wattsRef = pow(10.0f, dbmRefTotal / 10.0f) / 1000.0f;
+    } else { wattsRef = 0.0f; }
+    if (wattsFwd > 0.5f) { 
+        float gamma = sqrt(wattsRef / wattsFwd);
+        if (gamma < 0.98f) { swr = (1.0f + gamma) / (1.0f - gamma); } else { swr = 9.99f; }
+        if (swr < 1.00f) swr = 1.00f;
+    } else { swr = 1.00f; }
+}
+
+// ВОССТАНОВЛЕНО СТРОГО ПО ТЗ: Двухточечный расчет калибровки AD8307
+  void processTwoPointCalibration() {
+    // СТРОГО ИСПРАВЛЕНО ПО ТЗ: Опорные реперы переведены на 5 Вт (37 dBm) и 500 Вт (57 dBm)
+    float dbmPt1 = 37.0f - COUPLER_ATTN; 
+    float dbmPt2 = 57.0f - COUPLER_ATTN; 
+    if (lastVoltPt2 > lastVoltPt1 && lastVoltPt1 > 0.2f) {
+        CAL_AD8307_SLOPE = (lastVoltPt2 - lastVoltPt1) / (dbmPt2 - dbmPt1);
+        cal_intercepts = dbmPt1 - ((lastVoltPt1 - 0.25f) / CAL_AD8307_SLOPE);
+        prefs.begin("calib", false);
+        prefs.putFloat("slope", CAL_AD8307_SLOPE);
+        prefs.putFloat("intercept", cal_intercepts);
+        prefs.end();
+    }
+}
+// ВОССТАНОВЛЕНО: Константный монолитный массив во Flash-памяти для хранения стилей (PROGMEM)
+const char HTML_STYLES[] PROGMEM = R"rawliteral(
+<style>
+body { font-family: Arial, sans-serif; background: #070709; color: #dcdce2; text-align: center; padding: 10px; margin: 0; user-select: none; }
+.panel { background: #101115; border: 4px solid #23252d; border-radius: 4px; display: inline-block; padding: 15px; box-shadow: 0 0 35px rgba(0,0,0,0.9); width: 95%; max-width: 640px; text-align: left; position: relative; }
+.header-grid { display: flex; justify-content: space-between; align-items: center; font-size: 0.9rem; font-weight: bold; color: #a2a4ad; letter-spacing: 2px; margin-bottom: 15px; border-bottom: 1px solid #23252d; padding-bottom: 5px; }
+.header-date { color: #8e8e9f; font-family: monospace; }
+.header-title { color: #ffffff; text-transform: uppercase; letter-spacing: 3px; }
+.header-time { color: #00ff66; font-family: monospace; }
+.meters-grid { background: #000000; border: 2px solid #23252d; padding: 12px; border-radius: 4px; display: flex; flex-direction: column; gap: 12px; }
+.fwd-row { width: 100%; } .sub-meters-row { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
+.meter-title { font-size: 0.75rem; font-weight: bold; color: #a2a4ad; margin-bottom: 3px; display: flex; justify-content: space-between; }
+.meter-scale-labels { display: flex; justify-content: space-between; font-size: 0.65rem; color: #5c5e66; font-family: monospace; margin-top: 2px; }
+.bar-container { display: flex; gap: 1px; background: #08090c; padding: 2px; height: 12px; border: 1px solid #1c1d24; }
+.bar-segment { flex: 1; background: #14161d; border-radius: 1px; transition: background 0.05s ease; }
+.main-grid { display: grid; grid-template-columns: 3.5fr 3fr 4.5fr; gap: 12px; margin-top: 15px; }
+.left-display-column { display: flex; flex-direction: column; gap: 12px; }
+.freq-box, .wifi-box { background: #000000; border: 2px solid #23252d; border-radius: 4px; padding: 10px 6px; display: flex; flex-direction: column; justify-content: center; align-items: center; box-shadow: inset 0 0 15px rgba(255,153,0,0.05); height: 85px; box-sizing: border-box; overflow: hidden; }
+
+/* ДОБАВЛЕНО: Прецизионный стиль компактной рамки антенного анализатора по ТЗ */
+.ant-status-box {
+  background: #0d0f14;
+  border: 1px solid #ff9900; /* Контур сделаем оранжевым, как приборы Icom */
+  border-radius: 4px;
+  width: 75px;
+  height: 85px;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  font-family: monospace;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+.ant-status-title {
+  color: #ff9900;
+  font-size: 0.6rem;
+  font-weight: bold;
+  text-align: center;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid #1a1c23;
+  padding-bottom: 2px;
+}
+.ant-status-val {
+  color: #ffffff;
+  font-size: 0.65rem;
+  display: flex;
+  justify-content: space-between;
+}
+.ant-status-lbl {
+  color: #8e8e9f;
+}
+
+.input-select { font-size: 0.65rem; color: #4a86e8; font-weight: bold; align-self: flex-start; margin-bottom: 3px; letter-spacing: 1px; }
+.freq-val { font-size: 1.15rem; font-weight: bold; color: #ffffff; font-family: 'Courier New', monospace; letter-spacing: 0.5px; }
+.band-title { font-size: 0.75rem; color: #ff9900; font-weight: bold; margin-top: 4px; letter-spacing: 1px; text-transform: uppercase; }
+.wifi-title { font-size: 0.65rem; color: #00ff66; font-weight: bold; align-self: flex-start; margin-bottom: 3px; letter-spacing: 1px; }
+.wifi-detail { font-size: 0.65rem; color: #ffffff; font-family: 'Courier New', monospace; width: 100%; text-align: left; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.telemetry-box { background: #000000; border: 2px solid #23252d; border-radius: 4px; display: flex; flex-direction: column; height: 182px; box-sizing: border-box; box-shadow: inset 0 0 15px rgba(0,255,102,0.02); overflow: hidden; }
+.tel-row { flex: 1; display: flex; align-items: center; justify-content: space-between; padding: 0 8px; border-bottom: 1px solid #14161d; font-family: 'Courier New', monospace; font-size: 0.75rem; font-weight: bold; }
+.tel-row:last-child { border-bottom: none; } .tel-lbl { color: #8e8e9f; font-size: 0.7rem; } .tel-val { color: #ffffff; }
+.mini-bar-container { display: flex; gap: 1px; background: #08090c; padding: 1px; height: 8px; width: 45px; border: 1px solid #1c1d24; margin: 0 4px; }
+.mini-segment { flex: 1; background: #14161d; border-radius: 0.5px; transition: background 0.05s ease; }
+.control-box { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 85px 85px 85px; gap: 12px 10px; }
+.icom-btn { background: linear-gradient(180deg, #282a35 0%, #181921 100%); border: 1px solid #3d4150; border-radius: 4px; color: #ffffff; font-size: 0.75rem; font-weight: bold; height: 85px; box-sizing: border-box; text-align: center; cursor: pointer; text-transform: uppercase; letter-spacing: 1px; box-shadow: 0 2px 4px rgba(0,0,0,0.4); display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.icom-btn:active { background: #111217; border-color: #222; } .btn-led { width: 16px; height: 4px; background: #444; margin-top: 5px; border-radius: 1px; }
+.led-active-green { background: #00ff66; box-shadow: 0 0 8px #00ff66; } .led-active-orange { background: #ff9900; box-shadow: 0 0 8px #ff9900; }
+.menu-grid { display: none; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 15px; }
+.menu-sub-page { display: none; background: #000000; border: 2px solid #23252d; padding: 15px; border-radius: 4px; margin-top: 15px; text-align: center; }
+.sub-title { font-size: 1rem; font-weight: bold; color: #ff9900; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; }
+.time-input { background: #14161d; border: 1px solid #3d4150; color: #fff; padding: 6px; border-radius: 4px; width: 45px; text-align: center; font-size: 0.9rem; margin: 3px; font-family: monospace; }
+.prot-container { display: flex; flex-direction: column; gap: 10px; padding: 5px; background: #000000; border-radius: 4px; }
+.prot-card { background: #0c0d12; border: 1px solid #1c1d24; border-radius: 4px; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.prot-info { display: flex; flex-direction: column; text-align: left; width: 140px; } .prot-name { font-size: 0.75rem; font-weight: bold; color: #ff9900; text-transform: uppercase; letter-spacing: 0.5px; } .prot-range { font-size: 0.6rem; color: #5c5e66; font-family: monospace; margin-top: 1px; }
+.hitech-slider { flex: 1; -webkit-appearance: none; appearance: none; background: #181921; height: 6px; border-radius: 3px; border: 1px solid #23252d; outline: none; transition: all 0.15s; }
+.hitech-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; border-radius: 2px; background: #00ff66; border: 1px solid #ffffff; cursor: pointer; box-shadow: 0 0 6px #00ff66; transition: all 0.1s; }
+.hitech-slider::-webkit-slider-thumb:hover { transform: scale(1.15); background: #ffffff; box-shadow: 0 0 10px #00ff66; }
+.hitech-input { background: #14161d; border: 1px solid #3d4150; color: #00ff66; font-family: monospace; font-size: 0.8rem; font-weight: bold; width: 55px; height: 24px; text-align: center; border-radius: 3px; outline: none; box-sizing: border-box; }
+.hitech-input:focus { border-color: #00ff66; box-shadow: 0 0 5px rgba(0,255,102,0.3); background: #08090c; }
+.prot-action-btn { background: linear-gradient(180deg, #282a35 0%, #181921 100%); border: 1px solid #3d4150; color: #fff; font-weight: bold; font-size: 0.8rem; letter-spacing: 1px; text-transform: uppercase; padding: 10px 20px; border-radius: 4px; cursor: pointer; width: 48%; box-sizing: border-box; }
+.prot-action-btn:active { background: #111217; } .trip-banner { background: linear-gradient(180deg, #400000 0%, #200000 100%); border: 2px solid #ff3333; border-radius: 4px; padding: 12px; margin-bottom: 15px; color: #ffffff; font-weight: bold; font-family: monospace; display: none; text-align: center; box-shadow: 0 0 20px rgba(255,51,51,0.4); animation: blinkBg 2s infinite; }
+@keyframes blinkBg { 0% { border-color: #ff3333; } 50% { border-color: #900; } 100% { border-color: #ff3333; } }
+.hitech-container { background: #090a0e; border: 1px solid #00ff66; border-radius: 6px; padding: 20px; box-shadow: 0 0 15px rgba(0,255,102,0.15); display: inline-block; width: 85%; max-width: 400px; margin: 10px 0; }
+.hitech-label { background: linear-gradient(180deg, #161c18 0%, #0c100d 100%); border: 1px dashed #00ff66; color: #00ff66; padding: 15px; display: block; border-radius: 4px; cursor: pointer; font-size: 0.8rem; font-weight: bold; letter-spacing: 1.5px; text-transform: uppercase; transition: all 0.2s; box-shadow: inset 0 0 10px rgba(0,255,102,0.05); margin-bottom: 15px; }
+.hitech-label:hover { background: #00ff66; color: #000; box-shadow: 0 0 15px #00ff66; }
+.hitech-btn-start { background: linear-gradient(180deg, #00ff66 0%, #00b347 100%); border: none; color: #ffffff !important; font-size: 0.85rem; font-weight: bold; padding: 14px 28px; border-radius: 4px; cursor: pointer; text-transform: uppercase; letter-spacing: 1.5px; box-shadow: 0 4px 10px rgba(0,255,102,0.3); text-shadow: 0 1px 3px rgba(0,0,0,0.6); display: inline-block; transition: all 0.15s; }
+.hitech-btn-start:active { transform: scale(0.98); background: #00b347; } .hitech-progress-bg { background: #11141a; border: 1px solid #232936; border-radius: 4px; height: 22px; position: relative; margin-top: 15px; overflow: hidden; display: none; }
+.hitech-progress-bar { background: linear-gradient(90deg, #00b347, #00ff66); height: 100%; width: 0%; transition: width 0.1s ease; box-shadow: 0 0 10px #00ff66; }
+.hitech-progress-text { position: absolute; width: 100%; top: 0; left: 0; line-height: 22px; font-size: 0.75rem; font-weight: bold; color: #ffffff; text-shadow: 1px 1px 2px #000; font-family: monospace; }
+</style>
+)rawliteral";
+
+// Константный монолитный массив во Flash-памяти для хранения JS-логики (PROGMEM)
+const char HTML_SCRIPTS[] PROGMEM = R"rawliteral(
+<script>
+
+let active_antenna_id = 1; // Локальная переменная отслеживания номера антенного реле
+// Автомат циклического последовательного переключения 4-х антенн по нажатию на плитку ANTENNA в control-box
+function cycleAntenna() {
+  let nextAnt = (active_antenna_id % 4) + 1;
+  let names = ["", "MAIN BEAM", "INV-V BEAM", "GP VERTICAL", "DUMMY LOAD"];
+  
+  fetch('/set_ant?id=' + nextAnt).then(r => r.text()).then(resId => {
+    active_antenna_id = parseInt(resId);
+    
+    // Переключаем 4 зеленых индикатора внутри плитки на Главном экране
+    for (let i = 1; i <= 4; i++) {
+      let led = document.getElementById('ant-led' + i);
+      if (led) {
+        if (i === active_antenna_id) {
+          led.classList.add('led-active-green'); // Включаем фирменный зеленый неон
+        } else {
+          led.classList.remove('led-active-green'); // Гасим остальные
+        }
+      }
+      
+      // Синхронизируем рамки кнопок внутри скрытого подменю page-ant
+      let btn = document.getElementById('btn-ant' + i);
+      if (btn) {
+        if (i === active_antenna_id) { btn.style.borderColor = "#ff9900"; btn.firstElementChild.style.color = "#ff9900"; }
+        else { btn.style.borderColor = "#2c2e3a"; btn.firstElementChild.style.color = "#ffffff"; }
+      }
+    }
+    
+    // Синхронизируем текстовый статус в подменю антенн
+    let msgArea = document.getElementById('ant-status-msg');
+    if (msgArea) msgArea.innerText = "ACTIVE ROUTE: ANTENNA " + active_antenna_id + " (" + names[active_antenna_id] + ")";
+  });
+}
+
+// Синхронизация горящего индикатора с сохраненным значением Flash при старте страницы УМ
+document.addEventListener("DOMContentLoaded", function() {
+  setTimeout(() => {
+    fetch('/set_ant?id=' + active_antenna_id).then(r => r.text()).then(resId => {
+      active_antenna_id = parseInt(resId);
+      for (let i = 1; i <= 4; i++) {
+        let led = document.getElementById('ant-led' + i);
+        if (led) {
+          if (i === active_antenna_id) led.classList.add('led-active-green');
+          else led.classList.remove('led-active-green');
+        }
+      }
+    });
+  }, 1200);
+});
+
+function linkSl(id, val) {
+  document.getElementById(id).value = val;
+  document.getElementById(id + '-in').value = val;
+}
+
+let activeSubPage = null;
+function showScreen(scr) {
+  document.getElementById('main-scr').style.display = (scr == 'main') ? 'grid' : 'none';
+  document.getElementById('menu-scr').style.display = (scr == 'menu') ? 'grid' : 'none';
+  if (activeSubPage) document.getElementById(activeSubPage).style.display = 'none';
+  if (scr != 'main' && scr != 'menu') {
+    document.getElementById(scr).style.display = 'block';
+    activeSubPage = scr;
+    if (scr === 'page-ant' && typeof loadAntMap === 'function') loadAntMap();
+  }
+}
+
+function saveProtSettings() {
+  let p = new URLSearchParams();
+  p.append('id', document.getElementById('sl-id').value);
+  p.append('vd', document.getElementById('sl-vd').value);
+  p.append('swr', document.getElementById('sl-swr').value);
+  p.append('pin', document.getElementById('sl-pin').value);
+  p.append('pout', document.getElementById('sl-pout').value);
+  p.append('pref', document.getElementById('sl-pref').value);
+  p.append('lpf', document.getElementById('sl-lpf').value);
+  p.append('txtime', document.getElementById('sl-txtime').value);
+  p.append('temp', document.getElementById('sl-temp').value);
+  fetch('/save_prot?' + p.toString()).then(r => r.text()).then(msg => { alert(msg); });
+}
+
+function resetTrip() {
+  fetch('/reset_trip').then(r => r.text()).then(msg => { alert(msg); });
+}
+
+    function saveInterfaceProto() {
+      let val = document.getElementById('sel-proto').value;
+      fetch('/save_ext_proto?val=' + val).then(r => r.text()).then(msg => { 
+        alert(msg); 
+        window.selProtoInitialized = false; // Позволяем обновить статус на экране
+      });
+    }
+
+    function toggleBypass() {
+      let led = document.getElementById('led-bypass');
+      if (!led) return;
+      if (led.className.includes('led-active-orange')) {
+        led.className = 'btn-led led-active-green';
+        fetch('/set_bypass?val=1'); // Отправляем единицу (Включить обход УМ)
+      } else {
+        led.className = 'btn-led led-active-orange';
+        fetch('/set_bypass?val=0'); // Отправляем ноль (УМ в тракте)
+      }
+    }
+      function saveFanSettings() {
+        let p = new URLSearchParams();
+        p.append('tmin', document.getElementById('fan-tmin').value);
+        p.append('tmax', document.getElementById('fan-tmax').value);
+        p.append('pmin', document.getElementById('fan-pmin').value);
+        fetch('/save_fan?' + p.toString()).then(r => r.text()).then(msg => { alert(msg); });
+      }
+
+            function saveWifiSettings() {
+        let p = new URLSearchParams();
+        p.append('ssid', document.getElementById('net-ssid').value);
+        p.append('pass', document.getElementById('net-pass').value);
+        fetch('/save_wifi?' + p.toString()).then(r => r.text()).then(msg => { alert(msg); });
+      }
+
+      function saveSequencerTimings() {
+        let p = new URLSearchParams();
+        p.append('o_tx', document.getElementById('s-out-tx').value);
+        p.append('o_rx', document.getElementById('s-out-rx').value);
+        p.append('b_tx', document.getElementById('s-bias-tx').value);
+        p.append('b_rx', document.getElementById('s-bias-rx').value);
+        p.append('i_tx', document.getElementById('s-in-tx').value);
+        p.append('i_rx', document.getElementById('s-in-rx').value);
+        fetch('/save_seq?' + p.toString()).then(r => r.text()).then(msg => {
+          document.getElementById('seq-msg').innerText = "MATRIX STATUS: " + msg;
+          alert(msg);
+        });
+      }
+
+      function clickAnt(id, name) {
+        fetch('/set_ant?id=' + id).then(r => r.text()).then(resId => {
+          let actId = parseInt(resId);
+          document.getElementById('ant-status-msg').innerText = "ACTIVE ROUTE: ANTENNA " + actId + " (" + name + ")";
+          for (let i = 1; i <= 4; i++) {
+            let btn = document.getElementById('btn-ant' + i);
+            if (i === actId) { btn.style.borderColor = "#ff9900"; btn.firstElementChild.style.color = "#ff9900"; }
+            else { btn.style.borderColor = "#2c2e3a"; btn.firstElementChild.style.color = "#ffffff"; }
+          }
+        });
+      }
+
+      const bandMapLabels = ["160m", "80m", "40m", "20m/30m", "17m/12m", "12m/10m", "6m"];
+
+      function loadAntMap() {
+        fetch('/get_ant_map').then(r => r.text()).then(data => {
+          let vals = data.split(',');
+          for (let i = 0; i < bandMapLabels.length; i++) {
+            let sel = document.getElementById('bmap-' + i);
+            if (sel && vals[i]) sel.value = vals[i];
+          }
+        });
+      }
+
+      function saveAntMap() {
+        let p = new URLSearchParams();
+        for (let i = 0; i < bandMapLabels.length; i++) {
+          p.append('b' + i, document.getElementById('bmap-' + i).value);
+        }
+        fetch('/save_ant_map?' + p.toString()).then(r => r.text()).then(msg => {
+          document.getElementById('ant-map-msg').innerText = msg;
+          alert(msg);
+        });
+      }
+
+      // Добавим автоматический опрос состояния антенны при входе в меню, чтобы кнопка сразу загоралась оранжевым
+      document.addEventListener("DOMContentLoaded", function() {
+        loadAntMap();
+        setTimeout(() => {
+          let currentAntId = 1;
+          let names = ["", "MAIN BEAM", "INV-V BEAM", "GP VERTICAL", "DUMMY LOAD"];
+          clickAnt(currentAntId, names[currentAntId]);
+        }, 1000);
+      });
+
+      function toggleTrxManual() {
+      fetch('/toggle_trx').then(r => r.text()).then(msg => { console.log(msg); });
+      }
+
+function saveManualTime() {
+  let p = new URLSearchParams();
+  p.append('d', document.getElementById('tm-d').value);
+  p.append('m', document.getElementById('tm-m').value);
+  p.append('y', document.getElementById('tm-y').value);
+  p.append('h', document.getElementById('tm-h').value);
+  p.append('min', document.getElementById('tm-min').value);
+  p.append('s', document.getElementById('tm-s').value);
+  fetch('/set_time?' + p.toString()).then(r => r.text()).then(msg => { document.getElementById('time-msg').innerText = msg; });
+}
+
+// ДОБАВЛЕНО: Автоматический захват и отправка системного времени ПК на контроллер УМ
+function syncPcTime() {
+  let now = new Date();
+  let p = new URLSearchParams();
+  p.append('d', now.getDate());
+  p.append('m', now.getMonth() + 1); // В JS отсчет месяцев идет с 0
+  p.append('y', now.getFullYear());
+  p.append('h', now.getHours());
+  p.append('min', now.getMinutes());
+  p.append('s', now.getSeconds());
+  
+  fetch('/set_time?' + p.toString()).then(r => r.text()).then(msg => {
+    document.getElementById('time-msg').innerText = "СТАТУС: " + msg;
+    alert("Время успешно синхронизировано с ПК!\n" + now.toLocaleTimeString());
+  });
+}
+
+function saveSequencerTimings() {
+  let p = new URLSearchParams();
+  p.append('o_tx', document.getElementById('s-out-tx').value);
+  p.append('o_rx', document.getElementById('s-out-rx').value);
+  p.append('b_tx', document.getElementById('s-bias-tx').value);
+  p.append('b_rx', document.getElementById('s-bias-rx').value);
+  p.append('i_tx', document.getElementById('s-in-tx').value);
+  p.append('i_rx', document.getElementById('s-in-rx').value);
+  fetch('/save_seq?' + p.toString()).then(r => r.text()).then(msg => {
+    document.getElementById('seq-msg').innerText = "MATRIX STATUS: " + msg;
+    alert(msg);
+  });
+}
+
+function setCalPoint(pt) {
+  fetch('/set_cal?pt=' + pt).then(r => r.text()).then(msg => { document.getElementById('cal-msg').innerText = msg; });
+}
+
+// Прецизионный чистый программный клик по инпуту (строго один раз)
+function triggerFileSelect() {
+  var fileInput = document.getElementById('file');
+  if (fileInput) { fileInput.click(); }
+}
+
+// СТРОГО ИСПРАВЛЕНО: Интерактивный метод считывания первого файла, вывод имени и прецизионный POST-стриминг
+function uploadRouter() {
+  var fileInput = document.getElementById('file');
+  if (!fileInput || fileInput.files.length === 0) { alert('Сначала выберите файл .bin!'); return; }
+  var formData = new FormData();
+  formData.append('update', fileInput.files[0]); // Строгий захват первого элемента массива файлов
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/update', true);
+  document.getElementById('hitech-prg-block').style.display = 'block';
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      var p = Math.round((e.loaded / e.total) * 100);
+      document.getElementById('hitech-bar').style.width = p + '%';
+      document.getElementById('hitech-txt').innerText = 'ЗАГРУЗКА: ' + p + '%';
+    }
+  };
+  xhr.onload = function() {
+    if (xhr.status == 200) {
+      document.getElementById('hitech-txt').innerText = 'УСПЕХ! СЕТЕВАЯ ПЕРЕЗАГРУЗКА...';
+      // СТРОГО ПО ТЗ: перед перезагрузкой сбрасываем адрес на корень '/', чтобы браузер сам открыл ГЛАВНЫЙ ЭКРАН
+      setTimeout(function() { window.location.href = '/'; }, 5000);
+    } else {
+      document.getElementById('hitech-txt').innerText = 'ОШИБКА ОБНОВЛЕНИЯ';
+    }
+  };
+  xhr.send(formData);
+}
+// Потоковый AJAX-опрос медленной телеметрии (раз в 500 мс)
+setInterval(function() {
+  fetch('/data').then(r => r.text()).then(d => {
+    let parts = d.split(',');
+    if (parts.length < 13) return;
+    let freqHz = parseFloat(parts[0]) * 1000000.0;
+    let fmt = parts[0]; let u = ' MHz';
+    if (freqHz >= 1000000) { fmt = (freqHz / 1000000).toFixed(6); u = ' MHz'; }
+    else if (freqHz >= 1000) { fmt = (freqHz / 1000).toFixed(3); u = ' kHz'; }
+    else { fmt = freqHz.toFixed(0); u = ' Hz'; }
+    
+    document.getElementById('freq-val').innerText = fmt + u;
+    document.getElementById('band-val').innerText = parts[1] + ' BAND';
+    document.getElementById('wf-ssid').innerText = 'SSID: ' + parts[2];
+    document.getElementById('wf-ip').innerText = 'IP: ' + parts[3];
+    document.getElementById('wf-rssi').innerText = 'RSSI: ' + parts[4] + ' dBm';
+    document.getElementById('lbl-date').innerText = parts[5];
+    document.getElementById('lbl-time').innerText = parts[6];
+    document.getElementById('val-vd').innerText = parseFloat(parts[7]).toFixed(2) + ' V';
+     
+// Динамически меняем надпись и ЦВЕТ TRX-1 / TRX-2 на Главном экране по данным 15-й ячейки
+let trxLabel = document.getElementById('lbl-trx-name');
+if (trxLabel) { 
+    let tId = parseInt(parts[15]) || 1;
+    
+    if (tId === 2) {
+        trxLabel.innerText = "TRX-2";
+        trxLabel.style.color = "#df80ff"; // Насыщенный сиреневый (неоновый оттенок)
+        trxLabel.style.textShadow = "0 0 5px #df80ff"; // Эффект неонового свечения
+    } else {
+        trxLabel.innerText = "TRX-1";
+        trxLabel.style.color = "#39ff14"; // Ярко-зеленый (Neon Green)
+        trxLabel.style.textShadow = "0 0 5px #39ff14"; // Эффект неонового свечения
+    }
+}
+
+    let ampVal = parseFloat(parts[8]);
+    document.getElementById('val-id').innerText = ampVal.toFixed(2) + ' A';
+    let segCount = Math.round((ampVal / 1.0) * 10);
+    if (segCount > 10) segCount = 10; if (segCount < 0) segCount = 0;
+    const mCells = document.getElementById('mb-id').getElementsByClassName('mini-segment');
+    for (let i = 0; i < 10; i++) { mCells[i].style.background = (i < segCount) ? '#ffaa00' : '#14161d'; }
+    
+    let tVal = parseFloat(parts[9]);
+    document.getElementById('val-temp').innerText = (tVal <= -127.0) ? 'ERR' : tVal.toFixed(1) + '°C';
+    
+    let isTripped = parseInt(parts[10]);
+    let reasonStr = parts[11];
+    let b = document.getElementById('scr-banner');
+    if (b) { if (isTripped == 1) { b.style.display = 'block'; b.innerText = 'АВАРИЯ: ' + reasonStr; } else { b.style.display = 'none'; } }
+    
+    let pinVal = parseFloat(parts[12]);
+    document.getElementById('val-pin').innerText = pinVal.toFixed(1) + ' W';
+    let segPin = Math.round((pinVal / 100.0) * 10);
+    if (segPin > 10) segPin = 10; if (segPin < 0) segPin = 0;
+    const pCells = document.getElementById('mb-pin').getElementsByClassName('mini-segment');
+    for (let i = 0; i < 10; i++) { pCells[i].style.background = (i < segPin) ? '#ffaa00' : '#14161d'; }
+    
+    let pType = parseInt(parts[13]);
+    let pNames = [
+    "PROT: PCNT (Counter)", 
+    "PROT: EXPERT TCI", 
+    "PROT: WOLF CAT", 
+    "PROT: ICOM CI-V", 
+    "PROT: YAESU CAT", 
+    "PROT: KENWOOD CAT"
+  ];
+
+ let activeName = (pType >= 0 && pType <= 5) ? pNames[pType] : "PROT: UNKNOWN";
+
+ // Выводим имя протокола в синее окно на Главном экране
+ document.getElementById('ext-proto').innerText = activeName;
+
+     // ПРЕЦИЗИОННОЕ ИСПРАВЛЕНИЕ: Читаем строго 14-ю ячейку массива телеметрии
+    let fanPwm = parseInt(parts[14]) || 0;
+    document.getElementById('val-fan-pwm').innerText = fanPwm + '%';
+    
+    // Рассчитываем, сколько из 10 светодиодных кубиков нужно зажечь неоном
+    let fanSegments = Math.round(fanPwm / 10);
+    let fanBox = document.getElementById('mb-fan-pwm');
+    if (fanBox) {
+        let segs = fanBox.getElementsByClassName('mini-segment');
+        for (let i = 0; i < segs.length; i++) {
+
+            // Закрашиваем активные сегменты фирменным оранжевым цветом раскачки, остальные тушим (темно-серые)
+            segs[i].style.background = (i < fanSegments) ? '#ff9900' : '#1a1c23';
+            segs[i].style.boxShadow = (i < fanSegments) ? '0 0 4px #ff9900' : 'none';
+        }
+    }
+
+ // Выводим имя протокола в статусную строку внутри папки настроек
+ if(document.getElementById('stat-p')) { document.getElementById('stat-p').innerText = activeName.replace("PROT: ", ""); }
+ // Автоматически выставляем правильную строчку в выпадающем списке при открытии страницы
+if(document.getElementById('sel-proto') && !window.selProtoInitialized) { 
+  document.getElementById('sel-proto').value = pType; 
+  window.selProtoInitialized = true; 
+}
+
+    let dot = document.getElementById('blink-dot');
+    if (dot) { dot.style.opacity = '1'; setTimeout(() => dot.style.opacity = '0', 120); }
+  });
+}, 500);
+
+// Высокоскоростной бинарный шлюз шкал мощности (раз в 60 мс)
+document.addEventListener('DOMContentLoaded', () => {
+  const bFwd = document.getElementById('bFwd');
+  const bRef = document.getElementById('bRef');
+  const bSwr = document.getElementById('bSwr');
+  let visualFwdWatts = 0.0; let visualRefWatts = 0.0;
+  setInterval(() => {
+    fetch('/fast_data').then(res => res.arrayBuffer()).then(buf => {
+      const view = new Float32Array(buf);
+      if (view.length >= 3) {
+        let fwdWatts = view[0]; let refWatts = view[1]; let swrVal = view[2];
+        document.getElementById('txtFwd').innerText = fwdWatts.toFixed(0);
+        document.getElementById('txtRef').innerText = refWatts.toFixed(1);
+        document.getElementById('txtSwr').innerText = swrVal.toFixed(2);
+        
+        if (fwdWatts > visualFwdWatts) { visualFwdWatts = fwdWatts; }
+        else { visualFwdWatts = visualFwdWatts * 0.85 + fwdWatts * 0.15; }
+        if (refWatts > visualRefWatts) { visualRefWatts = refWatts; }
+        else { visualRefWatts = visualRefWatts * 0.85 + refWatts * 0.15; }
+        
+        let segFwd = 0;
+        if (visualFwdWatts >= 1.0) {
+          let currentDbm = 10 * Math.log10(visualFwdWatts * 1000);
+          if (currentDbm >= 30.0) { segFwd = Math.round(((currentDbm - 30.0) / (64.77 - 30.0)) * 40); }
+          if (segFwd > 40) segFwd = 40; if (segFwd < 0) segFwd = 0;
+        }
+        let segRef = 0;
+        if (visualRefWatts >= 0.1) {
+          let refDbm = 10 * Math.log10(visualRefWatts * 1000);
+          if (refDbm >= 20.0) { segRef = Math.round(((refDbm - 20.0) / (50.0 - 20.0)) * 40); }
+          if (segRef > 40) segRef = 40; if (segRef < 0) segRef = 0;
+        }
+        let segSwr = 0;
+        if (swrVal > 1.0) {
+          if (swrVal <= 1.5) segSwr = Math.round(((swrVal - 1.0) / 0.5) * 5);
+          else if (swrVal <= 2.0) segSwr = 5 + Math.round(((swrVal - 1.5) / 0.5) * 5);
+          else if (swrVal <= 3.0) segSwr = 10 + Math.round(((swrVal - 2.0) / 1.0) * 10);
+          else if (swrVal <= 5.0) segSwr = 20 + Math.round(((swrVal - 3.0) / 2.0) * 10);
+          else segSwr = 30 + Math.round(((swrVal - 5.0) / 4.99) * 10);
+          if (segSwr > 40) segSwr = 40;
+        }
+        
+        const fCells = bFwd.getElementsByClassName('bar-segment');
+        const rCells = bRef.getElementsByClassName('bar-segment');
+        const sCells = bSwr.getElementsByClassName('bar-segment');
+        for (let i = 0; i < 40; i++) {
+          if (i < segFwd) fCells[i].style.background = i > 33 ? '#ff3333' : '#ffaa00'; else fCells[i].style.background = '#14161d';
+          if (i < segRef) rCells[i].style.background = i > 30 ? '#ff3333' : '#ffaa00'; else rCells[i].style.background = '#14161d';
+          if (i < segSwr) sCells[i].style.background = swrVal > 2.0 ? '#ff3333' : (swrVal > 1.5 ? '#ffaa00' : '#00ff66'); else sCells[i].style.background = '#14161d';
+        }
+        
+        const ledAmp = document.getElementById('led-amp');
+        const ledTuner = document.getElementById('led-tuner');
+        if (fwdWatts > 5.0) { ledAmp.className = 'btn-led led-active-green'; ledTuner.className = 'btn-led led-active-green'; }
+        else { ledAmp.className = 'btn-led'; ledTuner.className = 'btn-led led-active-orange'; }
+        // Прописываем инициализацию индикатора кнопки BYPASS в шлюзе шкал
+        const ledBypass = document.getElementById('led-bypass');
+        if (!ledBypass.className) ledBypass.className = 'btn-led led-active-orange';
+      }           
+    }).catch(err => console.error(err));
+  }, 60);
+});
+</script>
+)rawliteral";
+
+// Константный монолитный массив во Flash-памяти для хранения разметки страниц (PROGMEM)
+const char HTML_BODY_PART1[] PROGMEM = R"rawliteral(
+</head>
+<body>
+<div class='panel'>
+  <div class='trip-banner' id='scr-banner'></div>
+  
+  <!-- ШАПКА ВРЕМЕНИ И ДАТЫ -->
+  <div class='header-grid'>
+    <div class='header-date' id='lbl-date'>--.--.----</div>
+    <div class='header-title'>Linear Amplifier 1kw</div>
+    <div class='header-time' id='lbl-time'>--:--:--</div>
+  </div>
+  
+  <!-- ИЗМЕРИТЕЛЬНЫЕ ПРИБОРЫ (Po, Pr, SWR) -->
+  <div class='meters-grid'>
+    <div class='fwd-row'>
+      <div class='meter-title'><span>Po (FORWARD POWER)</span><span id='txtFwd' class='num-val' style='font-size:0.9rem;'>0</span></div>
+      <div class='bar-container' id='bFwd'>
+)rawliteral";
+
+const char HTML_BODY_PART2[] PROGMEM = R"rawliteral(
+      </div>
+      <div class='meter-scale-labels'><span>0W</span><span>200W</span><span>500W</span><span>1000W</span><span>1200W</span></div>
+    </div>
+    <div class='sub-meters-row'>
+      <div>
+        <div class='meter-title'><span>Pr (REFLECTED)</span><span id='txtRef' class='num-val' style='font-size:0.9rem;'>0.0</span></div>
+        <div class='bar-container' id='bRef'>
+)rawliteral";
+
+const char HTML_BODY_PART3[] PROGMEM = R"rawliteral(
+        </div>
+        <div class='meter-scale-labels'><span>0W</span><span>10W</span><span>40W</span><span>80W</span><span>120W</span></div>
+      </div>
+      <div>
+        <div class='meter-title'><span>SWR DETECTOR</span><span id='txtSwr' class='num-val' style='font-size:0.9rem;'>1.00</span></div>
+        <div class='bar-container' id='bSwr'>
+)rawliteral";
+
+const char HTML_BODY_PART4[] PROGMEM = R"rawliteral(
+        </div>
+        <div class='meter-scale-labels'><span>1.0</span><span>1.5</span><span>2.0</span><span>3.0</span><span>9.9</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= ЭКРАН 1: ГЛАВНЫЙ ЭКРАН (MAIN SCREEN) ================= -->
+  <div class='main-grid' id='main-scr'>
+    <div class='left-display-column'>
+      <div class='freq-box'>
+        <div class='input-select'>TRX-1</div>
+        <div class='freq-val'><span id='freq-val'>0.000000 MHz</span><span id='blink-dot' style='color:#ff3333; transition: opacity 0.1s; margin-left:2px;'>●</span></div>
+        <div class='band-title' id='band-val'>--- BAND</div>
+      </div>
+      <div class='wifi-box'>
+        <div class='wifi-title'>Wi-Fi STATUS</div>
+        <div class='wifi-detail' id='wf-ssid'>SSID: ---</div>
+        <div class='wifi-detail' id='wf-ip'>IP: ---</div>
+        <div class='wifi-detail' id='wf-rssi'>RSSI: --- dBm</div>
+      </div>
+    </div>
+    
+    <div class='telemetry-box'>
+      <div class='tel-row'>
+        <span class='tel-lbl'>Id:</span>
+        <div class='mini-bar-container' id='mb-id'>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+        </div>
+        <span class='tel-val' id='val-id'>0.00 A</span>
+      </div>
+      <div class='tel-row'><span class='tel-lbl'>TEMP:</span><span class='tel-val' id='val-temp'>25°C</span></div>
+      <div class='tel-row'>
+        <span class='tel-lbl'>P IN:</span>
+        <div class='mini-bar-container' id='mb-pin'>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+        </div>
+        <span class='tel-val' id='val-pin'>0.0 W</span>
+      </div>
+      <div class='tel-row' style='color:#00ff66;'><span class='tel-lbl' style='color:#00ff66;'>Vd:</span><span class='tel-val' id='val-vd' style='color:#00ff66;'>0.00 V</span></div>
+<div class='tel-row' onclick="showScreen('page-fan')" style='cursor:pointer; border-top:1px solid #14161d; padding-top:4px;'>
+  <span class='tel-lbl'>FAN ШИМ:</span>
+  <div class='mini-bar-container' id='mb-fan-pwm'>
+    <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+  </div>
+  <span class='tel-val' id='val-fan-pwm'>0%</span>
+</div>
+
+    </div> 
+    <div class='control-box'><div class='icom-btn'>AMP<div id='led-amp' class='btn-led'></div></div><div class='icom-btn'>TUNER<div id='led-tuner' class='btn-led led-active-orange'></div></div><div class='icom-btn'>ANTENNA<div class='btn-led led-active-green'></div></div><div class='icom-btn' onclick="showScreen('menu')" style='border-color:#ff9900; color:#ff9900;'>MENU<div class='btn-led led-active-orange'></div></div><div></div><div class='icom-btn' onclick='toggleBypass()' style='cursor:pointer;'>BYPASS<div id='led-bypass' class='btn-led led-active-orange'></div></div></div>  
+  </div>
+  
+  <!-- ================= ЭКРАН 2: СЕТКА МЕНЮ НАСТРОЕК (MENU SCREEN) ================= -->
+  <div class='menu-grid' id='menu-scr'>
+    <div class='icom-btn' onclick="showScreen('page-seq')">PTT Sequencer</div>
+    <div class='icom-btn' onclick="showScreen('page-ant')">Antenna</div>
+    <div class='icom-btn' onclick="showScreen('page-tun')">Tuner</div>
+    <div class='icom-btn' onclick="showScreen('page-int')">Интерфейсы</div>
+    <div class='icom-btn' onclick="showScreen('page-net')">Настройка сети</div>
+    <div class='icom-btn' onclick="showScreen('page-time')" style='border-color:#00ff66; color:#00ff66;'>Установка времени</div>
+    <div class='icom-btn' onclick="showScreen('page-prot')" style='border-color:#00ff66; color:#00ff66;'>Protection</div>
+    <div class='icom-btn' onclick="showScreen('page-sens')">Датчики (Id/Vd)</div>
+    <div class='icom-btn' onclick="showScreen('page-cal')" style='border-color:#ff9900; color:#ff9900;'>Калибровка AD8307</div>
+    <div class='icom-btn' onclick="showScreen('page-ota')" style='border-color:#00ff66; color:#00ff66;'>Обновление ПО</div>
+    <div class='icom-btn' onclick="showScreen('page-fan')" style='border-color:#ff9900; color:#ff9900;'>Климат / FAN</div>
+    <div class='icom-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333;'>◀ BACK</div>
+  </div>
+
+  <!-- ================= ЭКРАНЫ 3: ВЛОЖЕННЫЕ ПАПКИ НАСТРОЕК ================= -->
+  <div id='page-seq' class='menu-sub-page'><div class='sub-title'>Секвенсор задержек</div><p>Настройки таймингов реле</p><button class='prot-action-btn' onclick="showScreen('menu')">Назад</button></div>
+  <div id='page-ant' class='menu-sub-page'><div class='sub-title'>Конфигурация антенн</div><p>Выбор и привязка выходов</p><button class='prot-action-btn' onclick="showScreen('main')">Назад</button></div>
+  <div id='page-tun' class='menu-sub-page'><div class='sub-title'>Настройки тюнера</div><p>Параметры согласования</p><button class='prot-action-btn' onclick="showScreen('main')">Назад</button></div>
+  <div id='page-int' class='menu-sub-page'><div class='sub-title'>Внешние интерфейсы</div><p>Протоколы связи CAT / CI-V</p><button class='prot-action-btn' onclick="showScreen('main')">Назад</button></div>
+  <div id='page-net' class='menu-sub-page'><div class='sub-title'>Настройка сети</div><p>Конфигурация параметров Wi-Fi</p><button class='prot-action-btn' onclick="showScreen('main')">Назад</button></div>
+  
+  <!-- ДОБАВЛЕНО: Полная интерактивная папка настроек двухконтурного климат-контроля УМ -->
+  <div id='page-fan' class='menu-sub-page'>
+    <div class='sub-title' style='color:#ff9900;'>КЛИМАТ-КОНТРОЛЬ И ВЕНТИЛЯТОРЫ</div>
+
+    <div class='prot-container'>
+      <!-- КОНТУР 1: ДИСКРЕТНОЕ РЕЛЕ НА MCP23017 -->
+      <div style='font-size:0.75rem; color:#00ff66; font-weight:bold; text-align:left; margin:5px 12px;'>КОНТУР 1: РЕЛЕ ОХЛАЖДЕНИЯ (MCP23017)</div>
+      <div class='prot-card'>
+        <div class='prot-info'><span class='prot-name'>Темп. Включения</span><span class='prot-range'>30C - 75C</span></div>
+        <input type='range' id='fan-ton' min='30' max='75' step='1' value='50' class='hitech-slider' oninput='linkSl("fan-ton",this.value)'>
+        <input type='text' id='fan-ton-in' value='50' class='hitech-input' onchange='linkSl("fan-ton",this.value)'>
+      </div>
+      <div class='prot-card'>
+        <div class='prot-info'><span class='prot-name'>Темп. Выключения</span><span class='prot-range'>30C - 75C</span></div>
+        <input type='range' id='fan-toff' min='30' max='75' step='1' value='40' class='hitech-slider' oninput='linkSl("fan-toff",this.value)'>
+        <input type='text' id='fan-toff-in' value='40' class='hitech-input' onchange='linkSl("fan-toff",this.value)'>
+      </div>
+
+      <!-- КОНТУР 2: ПЛАВНЫЙ ШИМ НА ESP32-S3 -->
+      <div style='font-size:0.75rem; color:#4a86e8; font-weight:bold; text-align:left; margin:10px 12px 5px 12px;'>КОНТУР 2: ПЛАВНЫЙ ШИМ (ESP32-S3 GPIO 12)</div>
+      <div class='prot-card'>
+        <div class='prot-info'><span class='prot-name'>Старт ШИМ (Минимум)</span><span class='prot-range'>30C - 75C</span></div>
+        <input type='range' id='fan-tmin' min='30' max='75' step='1' value='35' class='hitech-slider' oninput='linkSl("fan-tmin",this.value)'>
+        <input type='text' id='fan-tmin-in' value='35' class='hitech-input' onchange='linkSl("fan-tmin",this.value)'>
+      </div>
+      <div class='prot-card'>
+        <div class='prot-info'><span class='prot-name'>Максимум ШИМ (100%)</span><span class='prot-range'>30C - 75C</span></div>
+        <input type='range' id='fan-tmax' min='30' max='75' step='1' value='65' class='hitech-slider' oninput='linkSl("fan-tmax",this.value)'>
+        <input type='text' id='fan-tmax-in' value='65' class='hitech-input' onchange='linkSl("fan-tmax",this.value)'>
+      </div>
+      <div class='prot-card'>
+        <div class='prot-info'><span class='prot-name'>Миним. обороты ШИМ</span><span class='prot-range'>10% - 50%</span></div>
+        <input type='range' id='fan-pmin' min='10' max='50' step='1' value='20' class='hitech-slider' oninput='linkSl("fan-pmin",this.value)'>
+        <input type='text' id='fan-pmin-in' value='20' class='hitech-input' onchange='linkSl("fan-pmin",this.value)'>
+      </div>
+    </div><br>
+
+    <div style='display:flex; justify-content:space-between; width:85%; max-width:400px; margin:0 auto; gap:10px;'>
+      <button class='prot-action-btn' onclick='saveFanSettings()' style='border-color:#00ff66; color:#00ff66; width:48%;'>СОХРАНИТЬ</button>
+      <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:48%;'>CANCEL</button>
+    </div>
+  </div>
+
+  <div id='page-sens' class='menu-sub-page'><div class='sub-title'>Калибровка датчиков</div><p>Настройка показаний Id / Vd / Temp</p><button class='prot-action-btn' onclick="showScreen('main')">Назад</button></div>
+  
+   <div id='page-cal' class='menu-sub-page'>
+    <div class='sub-title'>Калибровка AD8307</div>
+    <button class='prot-action-btn' style='width:auto; margin:5px;' onclick='setCalPoint(1)'>Записать Точку 1 (5 Вт)</button>
+    <button class='prot-action-btn' style='width:auto; margin:5px;' onclick='setCalPoint(2)'>Записать Точку 2 (500 Вт)</button>
+    <br><br><div id='cal-msg' style='color:#ff9900; font-weight:bold;'>Статус калибровки: готов</div><br>
+    <button class='prot-action-btn' onclick="showScreen('main')">Назад</button>
+  </div>
+
+    <!-- СТРОГО ИСПРАВЛЕНО: Современный лаконичный интерфейс синхронизации системного времени -->
+  <div id='page-time' class='menu-sub-page' style='text-align:center;'>
+    <div class='sub-title' style='color:#ffffff; letter-spacing:1px; margin-bottom:5px;'>SYSTEM CLOCK CONFIGURATION</div>
+    <div style='font-size:0.65rem; color:#5c5e66; letter-spacing:1px; margin-bottom:25px;'>INTERNAL POSIX REAL-TIME CLOCK SYNC</div>
+    
+    <div class='prot-container' style='padding:20px 10px; background:#0d0f14; border-radius:6px; margin-bottom:25px;'>
+      <div id='time-msg' style='color:#00ff66; font-weight:bold; font-size:0.9rem; font-family:monospace; margin-bottom:15px; letter-spacing:1px;'>СТАТУС ЧАСОВ: СИСТЕМА ИСПРАВНА</div>
+      <button class='prot-action-btn' style='width:85%; max-width:320px; height:45px; font-size:0.85rem; background:#ff9900; color:#000; font-weight:bold; letter-spacing:1px; border:none; border-radius:4px; box-shadow: 0 0 8px rgba(255,153,0,0.3);' onclick='syncPcTime()'>СИНХРОНИЗАЦИЯ ВРЕМЕНИ С ПК</button>
+    </div>
+
+    <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:85%; max-width:320px;'>Назад</button>
+  </div>
+
+  <!-- СТРОЖАЙШЕЕ ВЕТО: Оригинальное хай-тек содержимое папки Protection и OTA -->
+  <div id='page-prot' class='menu-sub-page'>
+    <div class='sub-title'>Настройка границ и порогов защиты</div>
+    <div class='prot-container' id='prot-container-anchor'>
+)rawliteral";
+
+// Единственный монолитный Flash-массив всей разметки интерфейса для исключения ошибок кавычек (PROGMEM)
+
+const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
+</head>
+<body>
+<div class='panel'>
+  <!-- СЕНСОРНЫЙ КЛИК-СБРОС АВАРИИ ПРЯМО С ГЛАВНОГО ЭКРАНА -->
+  <div class='trip-banner' id='scr-banner' onclick='resetTrip()' style='cursor:pointer;'></div>
+  
+  <div class='header-grid'>
+    <div class='header-date' id='lbl-date'>--.--.----</div>
+    <div class='header-title'>Linear Amplifier 1kw</div>
+    <div class='header-time' id='lbl-time'>--:--:--</div>
+  </div>
+  
+  <div class='meters-grid'>
+    <div class='fwd-row'>
+      <div class='meter-title'><span>Po (FORWARD POWER)</span><span id='txtFwd' class='num-val' style='font-size:0.9rem;'>0</span></div>
+      <div class='bar-container' id='bFwd'>
+        <div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div>
+      </div>
+      <div class='meter-scale-labels'><span>0W</span><span>200W</span><span>500W</span><span>1000W</span><span>1200W</span></div>
+    </div>
+    <div class='sub-meters-row'>
+      <div>
+        <div class='meter-title'><span>Pr (REFLECTED)</span><span id='txtRef' class='num-val' style='font-size:0.9rem;'>0.0</span></div>
+        <div class='bar-container' id='bRef'>
+          <div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div>
+        </div>
+        <div class='meter-scale-labels'><span>0W</span><span>10W</span><span>40W</span><span>80W</span><span>120W</span></div>
+      </div>
+      <div>
+        <div class='meter-title'><span>SWR DETECTOR</span><span id='txtSwr' class='num-val' style='font-size:0.9rem;'>1.00</span></div>
+        <div class='bar-container' id='bSwr'>
+          <div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div><div class='bar-segment'></div>
+        </div>
+        <div class='meter-scale-labels'><span>1.0</span><span>1.5</span><span>2.0</span><span>3.0</span><span>9.9</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= ЭКРАН 1: ГЛАВНЫЙ ЭКРАН (MAIN SCREEN) ================= -->
+  <div class='main-grid' id='main-scr'>
+    <div class='left-display-column'>   
+      <!-- СТРОГО ИСПРАВЛЕНО: Окно переведено в режим интерактивной кнопки ручного переключения TRX-1 / TRX-2 -->
+      <div class='freq-box' onclick='toggleTrxManual()' style='cursor:pointer;'>
+        <div class='input-select' id='lbl-trx-name' style='color: #00ff00; font-family: Arial, sans-serif; font-weight: bold; font-size: 16px; font-style: italic;'>TRX-1</div>
+        <div class='freq-val'><span id='freq-val'>0.000000 MHz</span><span id='blink-dot' style='color:#ff3333; transition: opacity 0.1s; margin-left:2px;'>●</span></div>
+        <div class='band-title' id='band-val'>--- BAND</div>
+      </div>
+
+      <div class='wifi-box' onclick="showScreen('page-net')" style='cursor:pointer;'>
+        <div class='wifi-title'>Wi-Fi STATUS</div>
+        <div class='wifi-detail' id='wf-ssid'>SSID: ---</div>
+        <div class='wifi-detail' id='wf-ip'>IP: ---</div>
+        <div class='wifi-detail' id='wf-rssi'>RSSI: --- dBm</div>
+      </div>
+
+            <!-- ДОБАВЛЕНО: Окно EXT COM STATUS строго ниже Wi-Fi -->
+
+           <!-- СТРОГО ИСПРАВЛЕНО: Горизонтальный ряд окон EXT COM STATUS и ANT MTR бок о бок -->
+      <div style='display:flex; justify-content:space-between; align-items:center; width:100%; margin-top:0px;'>
+        <div class='wifi-box' onclick="showScreen('page-int')" style='cursor:pointer; border-color:#4a86e8; height:85px; width:calc(100% - 85px); margin-top:0px;'>
+          <div class='wifi-title' style='color:#4a86e8;'>EXT COM STATUS</div>
+          <div class='wifi-detail' id='ext-proto' style='color:#ffffff; font-weight:bold;'>PROT: PCNT</div>
+          <div class='wifi-detail' id='ext-link' style='color:#ff3333;'>LINK: DISCONNECTED</div>
+          <div class='wifi-detail' id='ext-detail' style='color:#8e8e9f;'>NATIVE USB: NOT FOUND</div>
+        </div>
+                <!-- СТРОГО ИСПРАВЛЕНО ПО ТЗ: Окно ANT MTR переведено в режим интерактивной кнопки прямого вызова папки Антенн -->
+        <div class='ant-status-box' onclick="showScreen('page-ant')" style='cursor:pointer; margin-top:0px;'>
+          <div class='ant-status-title'>ANT MTR</div>
+          <div class='ant-status-val'><span class='ant-status-lbl'>R:</span><span id='ant-r'>0.0</span></div>
+          <div class='ant-status-val'><span class='ant-status-lbl'>X:</span><span id='ant-x'>0.0</span></div>
+          <div class='ant-status-val'><span class='ant-status-lbl'>F:</span><span id='ant-f'>0&deg;</span></div>
+          <div class='ant-status-val'><span class='ant-status-lbl'>S:</span><span id='ant-s' style='color:#00ff66;'>1.0</span></div>
+        </div>
+      </div>
+
+    </div>
+    
+    <!-- ЦЕНТРАЛЬНЫЙ БЛОК ПРИБОРОВ: P IN полностью сохранен на месте AUX (ВЕТО) -->
+    <div class='telemetry-box'>
+      <div class='tel-row'>
+        <span class='tel-lbl'>Id:</span>
+        <div class='mini-bar-container' id='mb-id'>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+        </div>
+        <span class='tel-val' id='val-id'>0.00 A</span>
+      </div>
+      <div class='tel-row'><span class='tel-lbl'>TEMP:</span><span class='tel-val' id='val-temp'>25°C</span></div>
+      <div class='tel-row'>
+        <span class='tel-lbl'>P IN:</span>
+        <div class='mini-bar-container' id='mb-pin'>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+        </div>
+        <span class='tel-val' id='val-pin'>0.0 W</span>
+      </div>
+      <div class='tel-row' style='color:#00ff66;'><span class='tel-lbl' style='color:#00ff66;'>Vd:</span><span class='tel-val' id='val-vd' style='color:#00ff66;'>0.00 V</span></div>
+      <div class='tel-row' onclick="showScreen('page-fan')" style='cursor:pointer; border-top:1px solid #14161d; padding-top:4px;'><span class='tel-lbl'>FAN ШИМ:</span><div class='mini-bar-container' id='mb-fan-pwm'><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div></div><span class='tel-val' id='val-fan-pwm'>0%</span></div>
+    </div>
+    
+    <div class='control-box'>
+      <div class='icom-btn'>AMP<div id='led-amp' class='btn-led'></div></div>
+      <div class='icom-btn'>TUNER<div id='led-tuner' class='btn-led led-active-orange'></div></div>
+
+      <!-- СТРОГО ОБНОВЛЕНО ПО ТЗ: Интерактивная плитка ANTENNA с циклическим шагом и 4-мя неоновыми индикаторами -->
+      <div class='icom-btn' onclick='cycleAntenna()' style='cursor:pointer; position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center;'>
+        ANTENNA
+        <!-- Ряд из 4-х индикаторов по вашему заводскому стилю (по умолчанию горит 1-й) -->
+        <div style='display:flex; gap:4px; margin-top:5px;'>
+          <div id='ant-led1' class='btn-led led-active-green'></div>
+          <div id='ant-led2' class='btn-led'></div>
+          <div id='ant-led3' class='btn-led'></div>
+          <div id='ant-led4' class='btn-led'></div>
+        </div>
+      </div>
+
+      <div class='icom-btn' onclick="showScreen('menu')" style='border-color:#ff9900; color:#ff9900;'>MENU<div class='btn-led led-active-orange'></div></div>
+      <div></div>
+      <div class='icom-btn' onclick='toggleBypass()' style='cursor:pointer;'>BYPASS<div id='led-bypass' class='btn-led led-active-orange'></div></div>
+    </div>
+  </div>
+  
+  <!-- ================= ЭКРАН 2: СЕТКА МЕНЮ НАСТРОЕК (MENU SCREEN) ================= -->
+  <div class='menu-grid' id='menu-scr'>
+    <div class='icom-btn' onclick="showScreen('page-seq')">PTT Sequencer</div>
+    <div class='icom-btn' onclick="showScreen('page-ant')">Antenna</div>
+    <div class='icom-btn' onclick="showScreen('page-tun')">Tuner</div>
+    <div class='icom-btn' onclick="showScreen('page-int')">Интерфейсы</div>
+    <div class='icom-btn' onclick="showScreen('page-net')">Настройка сети</div>
+    <div class='icom-btn' onclick="showScreen('page-time')" style='border-color:#00ff66; color:#00ff66;'>Установка времени</div>
+    <div class='icom-btn' onclick="showScreen('page-prot')" style='border-color:#00ff66; color:#00ff66;'>Protection</div>
+    <div class='icom-btn' onclick="showScreen('page-cal')" style='border-color:#ff9900; color:#ff9900;'>Калибровка AD8307</div>
+    <div class='icom-btn' onclick="showScreen('page-ota')" style='border-color:#00ff66; color:#00ff66;'>Обновление ПО</div>
+    <div></div>
+    <div class='icom-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333;'>◀ BACK</div>
+  </div>
+
+  <!-- ================= ЭКРАНЫ 3: ВЛОЖЕННЫЕ ПАПКИ НАСТРОЕК ================= -->
+
+    <!-- ДОБАВЛЕНО: Прецизионная панель SEQUENCER MATRIX CONTROL строго по фото-образцу ТЗ -->
+  <div id='page-seq' class='menu-sub-page' style='text-align:center;'>
+    <div class='sub-title' style='color:#ff9900; letter-spacing:1px; margin-bottom:5px;'>SEQUENCER MATRIX CONTROL</div>
+    <div style='font-size:0.65rem; color:#5c5e66; margin-bottom:20px; letter-spacing:1px;'>PRECISION TIMING FROM CRITICAL PTT INITIATION SIGNAL</div>
+    
+    <div class='prot-container' style='max-height:350px; overflow-y:auto; padding:5px;'>
+      
+      <!-- РАЗДЕЛ 1: ВЫХОДНОЕ РЕЛЕ -->
+      <div style='font-size:0.75rem; color:#ff9900; font-weight:bold; text-align:left; margin:5px 12px; letter-spacing:0.5px;'>1. RF OUTPUT RELAY TIMINGS</div>
+      <div class='prot-card' style='padding:8px 12px;'>
+        <div class='prot-info'><span class='prot-name' style='color:#00ff66; font-size:0.75rem;'>TX TURN-ON DELAY</span><span class='prot-val-display' style='color:#ff9900; font-weight:bold; font-family:monospace;' id='lbl-out-tx'>10ms</span></div>
+        <div style='font-size:0.6rem; color:#5c5e66; text-align:left; margin-bottom:6px;'>Delay from PTT active to Output Relay close. Range: 0-50ms</div>
+        <input type='range' id='s-out-tx' min='0' max='50' step='1' value='10' class='hitech-slider' style='width:100%;' oninput='document.getElementById("lbl-out-tx").innerText=this.value+"ms"'>
+      </div>
+      <div class='prot-card' style='padding:8px 12px;'>
+        <div class='prot-info'><span class='prot-name' style='color:#4a86e8; font-size:0.75rem;'>RX TURN-OFF DELAY</span><span class='prot-val-display' style='color:#ff9900; font-weight:bold; font-family:monospace;' id='lbl-out-rx'>30ms</span></div>
+        <div style='font-size:0.6rem; color:#5c5e66; text-align:left; margin-bottom:6px;'>Hold-on delay for Output Relay to release during RX drop. Range: 0-100ms</div>
+        <input type='range' id='s-out-rx' min='0' max='100' step='1' value='30' class='hitech-slider' style='width:100%;' oninput='document.getElementById("lbl-out-rx").innerText=this.value+"ms"'>
+      </div>
+
+      <!-- РАЗДЕЛ 2: СМЕЩЕНИЕ ЛДМОС -->
+      <div style='font-size:0.75rem; color:#ff9900; font-weight:bold; text-align:left; margin:15px 12px 5px 12px; letter-spacing:0.5px;'>2. LDMOS GATE BIAS CONTROL</div>
+      <div class='prot-card' style='padding:8px 12px;'>
+        <div class='prot-info'><span class='prot-name' style='color:#00ff66; font-size:0.75rem;'>TX BIAS POWER-ON DELAY</span><span class='prot-val-display' style='color:#ff9900; font-weight:bold; font-family:monospace;' id='lbl-bias-tx'>25ms</span></div>
+        <div style='font-size:0.6rem; color:#5c5e66; text-align:left; margin-bottom:6px;'>Delay from PTT active to applying gate bias voltage. Range: 0-100ms</div>
+        <input type='range' id='s-bias-tx' min='0' max='100' step='1' value='25' class='hitech-slider' style='width:100%;' oninput='document.getElementById("lbl-bias-tx").innerText=this.value+"ms"'>
+      </div>
+      <div class='prot-card' style='padding:8px 12px;'>
+        <div class='prot-info'><span class='prot-name' style='color:#4a86e8; font-size:0.75rem;'>RX BIAS POWER-OFF DELAY</span><span class='prot-range' style='color:#ff9900; font-weight:bold; font-family:monospace;' id='lbl-bias-rx'>5ms</span></div>
+        <div style='font-size:0.6rem; color:#5c5e66; text-align:left; margin-bottom:6px;'>Hold-on delay for cutting bias down during RX drop. Range: 0-50ms</div>
+        <input type='range' id='s-bias-rx' min='0' max='50' step='1' value='5' class='hitech-slider' style='width:100%;' oninput='document.getElementById("lbl-bias-rx").innerText=this.value+"ms"'>
+      </div>
+
+      <!-- РАЗДЕЛ 3: ВХОДНОЕ РЕЛЕ -->
+      <div style='font-size:0.75rem; color:#ff9900; font-weight:bold; text-align:left; margin:15px 12px 5px 12px; letter-spacing:0.5px;'>3. RF INPUT RELAY TIMINGS</div>
+      <div class='prot-card' style='padding:8px 12px;'>
+        <div class='prot-info'><span class='prot-name' style='color:#00ff66; font-size:0.75rem;'>TX TURN-ON DELAY</span><span class='prot-val-display' style='color:#ff9900; font-weight:bold; font-family:monospace;' id='lbl-in-tx'>15ms</span></div>
+        <div style='font-size:0.6rem; color:#5c5e66; text-align:left; margin-bottom:6px;'>Delay from PTT active to Input Relay close. Range: 0-50ms</div>
+        <input type='range' id='s-in-tx' min='0' max='50' step='1' value='15' class='hitech-slider' style='width:100%;' oninput='document.getElementById("lbl-in-tx").innerText=this.value+"ms"'>
+      </div>
+      <div class='prot-card' style='padding:8px 12px;'>
+        <div class='prot-info'><span class='prot-name' style='color:#4a86e8; font-size:0.75rem;'>RX TURN-OFF DELAY</span><span class='prot-val-display' style='color:#ff9900; font-weight:bold; font-family:monospace;' id='lbl-in-rx'>20ms</span></div>
+        <div style='font-size:0.6rem; color:#5c5e66; text-align:left; margin-bottom:6px;'>Hold-on delay for Input Relay to release during RX drop. Range: 0-100ms</div>
+        <input type='range' id='s-in-rx' min='0' max='100' step='1' value='20' class='hitech-slider' style='width:100%;' oninput='document.getElementById("lbl-in-rx").innerText=this.value+"ms"'>
+      </div>
+    </div>
+
+    <div id='seq-msg' style='color:#ff9900; font-weight:bold; font-size:0.8rem; margin:15px 0 10px 0; font-family:monospace;'>MATRIX STATUS: UNLINKED DESIGN MODE</div>
+
+    <div style='display:flex; justify-content:space-between; width:85%; max-width:400px; margin:0 auto; gap:10px;'>
+      <button class='prot-action-btn' onclick='saveSequencerTimings()' style='border-color:#00ff66; color:#00ff66; width:48%;'>SAVE TIMINGS</button>
+      <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:48%;'>НАЗАД</button>
+    </div>
+  </div>
+
+    <!-- ДОБАВЛЕНО: Прецизионная хай-тек панель ANTENNA COUPLER MATRIX строго по ТЗ -->
+  <div id='page-ant' class='menu-sub-page' style='text-align:center;'>
+    <div class='sub-title' style='color:#ff9900; letter-spacing:1px; margin-bottom:5px;'>ANTENNA COUPLER MATRIX</div>
+    <div style='font-size:0.65rem; color:#5c5e66; margin-bottom:25px; letter-spacing:1px;'>4-CHANNEL HIGH-POWER RF OUTPUT ROUTING CONFIGURATION</div>
+    
+    <div class='prot-container' style='padding:20px 10px; background:#0d0f14; border-radius:6px; margin-bottom:25px; border:1px solid #1a1c23;'>
+      <div id='ant-status-msg' style='color:#00ff66; font-weight:bold; font-size:0.85rem; font-family:monospace; margin-bottom:20px; letter-spacing:1px;'>ACTIVE ROUTE: ANTENNA 1 (MAIN BEAM)</div>
+      
+      <!-- Сетка 2х2 интерактивных объемных кнопок выбора антенн -->
+      <div style='display:grid; grid-template-columns: 1fr 1fr; gap:15px; width:90%; max-width:400px; margin:0 auto;'>
+        <!-- Антенна 1 (По умолчанию активна, рамка оранжевая Icom) -->
+        <div id='btn-ant1' onclick='clickAnt(1, "MAIN BEAM")' style='background:linear-gradient(145deg, #111319, #08090d); border:2px solid #ff9900; border-radius:6px; padding:15px 5px; color:#fff; cursor:pointer; font-family:monospace;'>
+          <div style='font-weight:bold; font-size:1.1rem; color:#ff9900;'>ANT 1</div>
+          <div style='font-size:0.6rem; color:#8e8e9f; margin-top:4px;'>50 OHM MAIN</div>
+        </div>
+        
+        <!-- Антенна 2 -->
+        <div id='btn-ant2' onclick='clickAnt(2, "INV-V BEAM")' style='background:linear-gradient(145deg, #111319, #08090d); border:1px solid #2c2e3a; border-radius:6px; padding:15px 5px; color:#fff; cursor:pointer; font-family:monospace;'>
+          <div style='font-weight:bold; font-size:1.1rem; color:#ffffff;'>ANT 2</div>
+          <div style='font-size:0.6rem; color:#8e8e9f; margin-top:4px;'>RESERVE INVERTED-V</div>
+        </div>
+        
+        <!-- Антенна 3 -->
+        <div id='btn-ant3' onclick='clickAnt(3, "GP VERTICAL")' style='background:linear-gradient(145deg, #111319, #08090d); border:1px solid #2c2e3a; border-radius:6px; padding:15px 5px; color:#fff; cursor:pointer; font-family:monospace;'>
+          <div style='font-weight:bold; font-size:1.1rem; color:#ffffff;'>ANT 3</div>
+          <div style='font-size:0.6rem; color:#8e8e9f; margin-top:4px;'>VERTICAL GP</div>
+        </div>
+        
+        <!-- Антенна 4 -->
+        <div id='btn-ant4' onclick='clickAnt(4, "DUMMY LOAD")' style='background:linear-gradient(145deg, #111319, #08090d); border:1px solid #2c2e3a; border-radius:6px; padding:15px 5px; color:#fff; cursor:pointer; font-family:monospace;'>
+          <div style='font-weight:bold; font-size:1.1rem; color:#ffffff;'>ANT 4</div>
+          <div style='font-size:0.6rem; color:#8e8e9f; margin-top:4px;'>DUMMY LOAD 50R</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Матрица привязки антенн к диапазонам -->
+    <div class='prot-container' style='padding:15px 10px; background:#0d0f14; border-radius:6px; margin-bottom:20px; border:1px solid #1a1c23;'>
+      <div style='color:#ff9900; font-weight:bold; font-size:0.75rem; letter-spacing:1px; margin-bottom:12px;'>BAND → ANTENNA BINDING MATRIX</div>
+      <div style='font-size:0.6rem; color:#5c5e66; margin-bottom:15px;'>Автоматический выбор антенны при смене диапазона</div>
+      <div style='display:flex; flex-direction:column; gap:6px; width:90%; max-width:400px; margin:0 auto;'>
+        <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
+          <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>160m</span>
+          <select id='bmap-0' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+        </div>
+        <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
+          <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>80m</span>
+          <select id='bmap-1' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+        </div>
+        <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
+          <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>40m</span>
+          <select id='bmap-2' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+        </div>
+        <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
+          <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>20m/30m</span>
+          <select id='bmap-3' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+        </div>
+        <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
+          <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>17m/12m</span>
+          <select id='bmap-4' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+        </div>
+        <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
+          <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>12m/10m</span>
+          <select id='bmap-5' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+        </div>
+        <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
+          <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>6m</span>
+          <select id='bmap-6' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+        </div>
+      </div>
+      <div id='ant-map-msg' style='color:#00ff66; font-size:0.7rem; font-family:monospace; margin-top:12px;'></div>
+      <button class='prot-action-btn' onclick='saveAntMap()' style='border-color:#00ff66; color:#00ff66; width:90%; max-width:400px; margin-top:10px;'>SAVE BAND MAP</button>
+    </div>
+
+    <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:90%; max-width:400px;'>НАЗАД</button>
+  </div>
+
+  <div id='page-tun' class='menu-sub-page'><div class='sub-title'>Настройки тюнера</div><p>Параметры согласования</p><button class='prot-action-btn' onclick="showScreen('main')">Назад</button></div>
+  
+  <!-- ДОБАВЛЕНО: Меню интерфейсов строго по вашему фото образца -->
+
+  <div id='page-int' class='menu-sub-page' style='text-align:center;'>
+    <div class='sub-title' style='color:#ffffff; letter-spacing:2px; margin-bottom:5px;'>TRANSCEIVER INTERFACE</div>
+    <div style='font-size:0.65rem; color:#5c5e66; letter-spacing:1px; margin-bottom:15px;'>CAT SYNC - WI-FI TCI & NATIVE USB CONTROL</div>
+    
+    <div style='background:#000000; border:1px dashed #00ff66; padding:10px; border-radius:4px; text-align:left; font-family:monospace; font-size:0.75rem; width:85%; max-width:400px; margin:0 auto 20px auto; line-height:1.5;'>
+      <div style='display:flex; justify-content:space-between;'><span style='color:#8e8e9f;'>ACTIVE PROTOCOL:</span><span style='color:#ff9900;' id='stat-p'>HARDWARE COUNTER (PCNT)</span></div>
+      <div style='display:flex; justify-content:space-between;'><span style='color:#8e8e9f;'>TCI WI-FI LINK:</span><span style='color:#ff3333;' id='stat-t'>DISCONNECTED</span></div>
+      <div style='display:flex; justify-content:space-between;'><span style='color:#8e8e9f;'>WOLF NATIVE USB:</span><span style='color:#ff3333;' id='stat-u'>NOT FOUND</span></div>
+    </div>
+
+    <div style='text-align:left; width:85%; max-width:400px; margin:0 auto 20px auto;'>
+      <div style='font-size:0.75rem; color:#00ff66; font-weight:bold; margin-bottom:5px; letter-spacing:1px;'>ACTIVE DATA PROTOCOL</div>
+      <div style='font-size:0.65rem; color:#5c5e66; margin-bottom:8px;'>Select primary method for tracking transceiver band & frequency</div>
+      <select id='sel-proto' class='time-input' style='width:100%; text-align:left; padding-left:10px; font-size:0.8rem; height:32px; box-sizing:border-box;'>
+        <option value='0' selected>0 - RESERVED HARDWARE COUNTER (PCNT)</option>
+        <option value='1'>1 - EXPERT ELECTRONICS TCI (WI-FI)</option>
+        <option value='2'>2 - DDC/DUC WOLF CAT (TS-2000 VIA USB)</option>
+        <option value='3'>3 - ICOM CI-V PROTOCOL (REMOTE BUS)</option>
+        <option value='4'>4 - YAESU CAT PROTOCOL (4800-38400 BPS)</option>
+        <option value='5'>5 - KENWOOD CAT PROTOCOL (TS-SERIES)</option>
+      </select>
+    </div>
+
+    <div style='display:flex; justify-content:space-between; width:85%; max-width:400px; margin:0 auto; gap:10px;'>
+      <button class='prot-action-btn' onclick='saveInterfaceProto()' style='border-color:#00ff66; color:#00ff66; width:48%;'>SAVE PROTOCOL</button>
+      <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:48%;'>CANCEL</button>
+    </div>
+  </div>
+
+    <!-- ДОБАВЛЕНО: Интерактивный хай-тек интерфейс конфигурации Wi-Fi параметров сети -->
+  <div id='page-net' class='menu-sub-page' style='text-align:center;'>
+    <div class='sub-title' style='color:#ffffff; letter-spacing:2px; margin-bottom:5px;'>WI-FI NETWORK CONFIGURATION</div>
+    <div style='font-size:0.65rem; color:#5c5e66; letter-spacing:1px; margin-bottom:20px;'>CONNECTIVITY PARAMETERS FOR LINEAR AMPLIFIER PANEL</div>
+    
+    <div style='text-align:left; width:85%; max-width:400px; margin:0 auto 15px auto;'>
+      <div style='font-size:0.75rem; color:#00ff66; font-weight:bold; margin-bottom:5px; letter-spacing:1px;'>NETWORK NAME (SSID)</div>
+      <input type='text' id='net-ssid' class='time-input' value='Dachnaja 8' style='width:100%; box-sizing:border-box; padding-left:10px; font-size:0.85rem; height:32px; font-family:monospace;'>
+    </div>
+
+    <div style='text-align:left; width:85%; max-width:400px; margin:0 auto 25px auto;'>
+      <div style='font-size:0.75rem; color:#00ff66; font-weight:bold; margin-bottom:5px; letter-spacing:1px;'>SECURITY PASSWORD</div>
+      <input type='password' id='net-pass' class='time-input' value='8101966G' style='width:100%; box-sizing:border-box; padding-left:10px; font-size:0.85rem; height:32px; font-family:monospace;'>
+    </div>
+
+    <div style='display:flex; justify-content:space-between; width:85%; max-width:400px; margin:0 auto; gap:10px;'>
+      <button class='prot-action-btn' onclick='saveWifiSettings()' style='border-color:#00ff66; color:#00ff66; width:48%;'>SAVE & REBOOT</button>
+      <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:48%;'>CANCEL</button>
+    </div>
+  </div>
+  
+  <div id='page-cal' class='menu-sub-page'>
+    <div class='sub-title'>Калибровка AD8307</div>
+    <button class='prot-action-btn' style='width:auto; margin:5px;' onclick='setCalPoint(1)'>Записать Точку 1 (5 Вт)</button>
+    <button class='prot-action-btn' style='width:auto; margin:5px;' onclick='setCalPoint(2)'>Записать Точку 2 (500 Вт)</button>
+    <br><br><div id='cal-msg' style='color:#ff9900; font-weight:bold;'>Статус калибровки: готов</div><br>
+    <!-- СТРОГО ИСПРАВЛЕНО: Кнопка возвращает пользователя на Главный экран (main) -->
+    <button class='prot-action-btn' onclick="showScreen('main')">Назад</button>
+  </div>
+  
+   <!-- СТРОГО ИСПРАВЛЕНО: Полная очистка дублей, лаконичное хай-тек меню времени УМ -->
+  <div id='page-time' class='menu-sub-page' style='text-align:center;'>
+    <div class='sub-title' style='color:#ff9900; letter-spacing:1px; margin-bottom:5px;'>УСТАНОВКА ВРЕМЕНИ И КАЛЕНДАРЯ</div>
+    <div style='font-size:0.65rem; color:#5c5e66; letter-spacing:1px; margin-bottom:25px;'>ВНУТРЕННИЕ ЧАСЫ РЕАЛЬНОГО ВРЕМЕНИ КИЛОВАТТНОГО УМ</div>
+    
+    <div class='prot-container' style='padding:25px 15px; background:#0d0f14; border-radius:6px; margin-bottom:25px; border:1px solid #1a1c23;'>
+      <div id='time-msg' style='color:#00ff66; font-weight:bold; font-size:0.85rem; font-family:monospace; margin-bottom:20px; letter-spacing:1px;'>Статус часов: идут</div>
+      <button class='prot-action-btn' style='width:90%; max-width:320px; height:45px; font-size:0.85rem; background:#ff9900; color:#000; font-weight:bold; letter-spacing:1px; border:none; border-radius:4px; box-shadow: 0 0 10px rgba(255,153,0,0.2);' onclick='syncPcTime()'>СИНХРОНИЗАЦИЯ С ПК</button>
+    </div>
+
+    <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:90%; max-width:320px;'>НАЗАД</button>
+  </div>
+
+    <div id='page-fan' class='menu-sub-page'><div class='sub-title' style='color:#ff9900;'>УПРАВЛЕНИЕ ВЕНТИЛЯТОРОМ УМ</div><div class='prot-container'><div style='font-size:0.75rem; color:#4a86e8; font-weight:bold; text-align:left; margin:5px 12px;'>НАСТРОЙКА КЛИМАТ-КОНТРОЛЯ (ШИМ ВЫВОД DevKit 14)</div><div class='prot-card'><div class='prot-info'><span class='prot-name'>Старт ШИМ (Минимум)</span><span class='prot-range'>30C - 75C</span></div><input type='range' id='fan-tmin' min='30' max='75' step='1' value='35' class='hitech-slider' oninput='linkSl("fan-tmin",this.value)'><input type='text' id='fan-tmin-in' value='35' class='hitech-input' onchange='linkSl("fan-tmin",this.value)'></div><div class='prot-card'><div class='prot-info'><span class='prot-name'>Максимум ШИМ (100%)</span><span class='prot-range'>30C - 75C</span></div><input type='range' id='fan-tmax' min='30' max='75' step='1' value='65' class='hitech-slider' oninput='linkSl("fan-tmax",this.value)'><input type='text' id='fan-tmax-in' value='65' class='hitech-input' onchange='linkSl("fan-tmax",this.value)'></div><div class='prot-card'><div class='prot-info'><span class='prot-name'>Миним. обороты ШИМ</span><span class='prot-range'>10% - 50%</span></div><input type='range' id='fan-pmin' min='10' max='50' step='1' value='20' class='hitech-slider' oninput='linkSl("fan-pmin",this.value)'><input type='text' id='fan-pmin-in' value='20' class='hitech-input' onchange='linkSl("fan-pmin",this.value)'></div></div><br><div style='display:flex; justify-content:space-between; width:85%; max-width:400px; margin:0 auto; gap:10px;'><button class='prot-action-btn' onclick='saveFanSettings()' style='border-color:#00ff66; color:#00ff66; width:48%;'>СОХРАНИТЬ</button><button class='prot-action-btn' onclick="showScreen('menu')" style='border-color:#ff3333; color:#ff3333; width:48%;'>CANCEL</button></div></div>
+
+  <div id='page-prot' class='menu-sub-page'>
+    <div class='sub-title'>Настройка границ и порогов защиты</div>
+    <div class='prot-container' id='prot-container-anchor'>
+)rawliteral";
+
+// ЕДИНСТВЕННЫЙ И ПРЕЦИЗИОННЫЙ ЭКЗЕМПЛЯР ФУНКЦИИ ВЫВОДА ПОЛЗУНКОВ (ЗАЩИТА ОТ REDEFINITION)
+String makeSliderCard(String name, String range, String id, float currentVal, float min, float max, float step) {
+  String card = "    <div class='prot-card'>";
+  card += "      <div class='prot-info'><span class='prot-name'>" + name + "</span><span class='prot-range'>" + range + "</span></div>";
+  card += "      <input type='range' id='" + id + "' min='" + String(min,0) + "' max='" + String(max,0) + "' step='" + String(step,1) + "' value='" + String(currentVal, (step==1.0f?0:1)) + "' class='hitech-slider' oninput='linkSl(\"" + id + "\",this.value)'>";
+  card += "      <input type='text' id='" + id + "-in' value='" + String(currentVal, (step==1.0f?0:1)) + "' class='hitech-input' onchange='linkSl(\"" + id + "\",this.value)'>";
+  card += "    </div>";
+  return card;
+}
+
+// ГЛАВНЫЙ СИНХРОНИЗИРОВАННЫЙ ОБРАБОТЧИК КИБЕР-ПАНЕЛИ (ПОТОКОВАЯ СБОРКА ИЗ МОНОЛИТНЫХ PROGMEM МАССИВОВ)
+  void handleRoot() {
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+
+  String s = "<!DOCTYPE html><html><head><meta charset='utf-8'>";
+  s += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  s += "<title>LINEAR AMPLIFIER 1kW</title>";
+  s += String(HTML_STYLES);
+  s += String(HTML_SCRIPTS);
+  s += String(HTML_BODY_NEW); // Сборка идет строго через исходный монолитный массив
+  
+  // Вывод 9 ползунков Protection с актуальными уставками из Flash
+  s += makeSliderCard("Ток стока Id", "15A - 70A", "sl-id", lim_id, 15, 70, 1.0f);
+  s += makeSliderCard("Напряжение Vd", "20V - 60V", "sl-vd", lim_vd, 20, 60, 1.0f);
+  s += makeSliderCard("Порог КСВ", "2.0 - 4.0", "sl-swr", lim_swr, 2, 4, 0.1f);
+  s += makeSliderCard("Входная Pin", "1W - 140W", "sl-pin", lim_pin, 1, 140, 1.0f);
+  s += makeSliderCard("Выходная FWD", "200W - 2500W", "sl-pout", lim_pout, 200, 2500, 50.0f);
+  s += makeSliderCard("Отраженная REF", "10W - 300W", "sl-pref", lim_pref, 10, 300, 5.0f);
+  s += makeSliderCard("Ток ФНЧ (LPF)", "0A - 30A", "sl-lpf", lim_lpf, 0, 30, 1.0f);
+  s += makeSliderCard("Таймаут TX", "0s - 60s", "sl-txtime", lim_tx_time, 0, 60, 1.0f);
+  s += makeSliderCard("Температура", "30C - 75C", "sl-temp", lim_temp, 30, 75, 1.0f);
+
+  s += "  </div><br><div style='display:flex; justify-content:space-between; width:85%; max-width:400px; margin:0 auto; gap:10px;'>";
+  s += "    <button class='prot-action-btn' onclick='saveProtSettings()' style='border-color:#00ff66; color:#00ff66;'>Сохранить</button>";
+  s += "    <button class='prot-action-btn' onclick='resetTrip()' style='border-color:#ff3333; color:#ff3333;'>Сброс Аварии</button>";
+  s += "  </div><br><br><button class='prot-action-btn' onclick=\"showScreen('main')\">Назад</button></div>";
+  s += "<div id='page-ota' class='menu-sub-page'><div class='sub-title'>Система сетевого обновления ПО</div><div class='hitech-container'>";
+  s += "    <label class='hitech-label' onclick='triggerFileSelect()'>Выбрать файл .bin</label>";
+ 
+  s += "    <input type='file' id='file' accept='.bin' style='display:none;' onchange='if(this.files.length > 0) { document.getElementById(\"hitech-file-name\").innerText=\"ВЫБРАН ФАЙЛ: \" + this.files[0].name; }'>";
+  s += "    <div id='hitech-file-name' style='font-size:0.8rem; color:#8e8e9f; margin-bottom:20px; font-family:monospace;'>ФАЙЛ НЕ ВЫБРАН</div>";
+  s += "    <button class='hitech-btn-start' onclick='uploadRouter()'>Запустить обновление</button>";
+
+  s += "    <div class='hitech-progress-bg' id='hitech-prg-block'><div class='hitech-progress-bar' id='hitech-bar'></div><div class='hitech-progress-text' id='hitech-txt'>ОЖИДАНИЕ...</div></div></div><br><br><button class='prot-action-btn' onclick=\"showScreen('main')\">Назад</button></div>";
+  s += "</div></body></html>";
+
+  server.send(200, "text/html", s);
+}
+
+// Сетевой обработчик сохранения всех 9 порогов защит в энергонезависимую Flash-память (Preferences)
+void handleSaveProt() {
+  if (!server.hasArg("id") || !server.hasArg("vd") || !server.hasArg("swr") || !server.hasArg("pin") ||
+      !server.hasArg("pout") || !server.hasArg("pref") || !server.hasArg("lpf") || !server.hasArg("txtime") || !server.hasArg("temp")) {
+    server.send(400, "text/plain", "Ошибка: Неполные данные защит!");
+    return;
+  }
+  lim_id = server.arg("id").toFloat();
+  lim_vd = server.arg("vd").toFloat();
+  lim_swr = server.arg("swr").toFloat();
+  lim_pin = server.arg("pin").toFloat();
+  lim_pout = server.arg("pout").toFloat();
+  lim_pref = server.arg("pref").toFloat();
+  lim_lpf = server.arg("lpf").toFloat();
+  lim_tx_time = server.arg("txtime").toInt();
+  lim_temp = server.arg("temp").toFloat();
+  prefs.begin("prot", false);
+  prefs.putFloat("id", lim_id);
+  prefs.putFloat("vd", lim_vd);
+  prefs.putFloat("swr", lim_swr);
+  prefs.putFloat("pin", lim_pin);
+  prefs.putFloat("pout", lim_pout);
+  prefs.putFloat("pref", lim_pref);
+  prefs.putFloat("lpf", lim_lpf);
+  prefs.putInt("txtime", lim_tx_time);
+  prefs.putFloat("temp", lim_temp);
+  prefs.end();
+  server.send(200, "text/plain", "Пороги защит успешно сохранены во Flash!");
+}
+
+// Сетевой обработчик кнопки ручного сброса триггера аварии after устранения проблемы в шеке
+void handleResetTrip() {
+  is_tripped = false;
+  trip_reason = "SYSTEM OK";
+  digitalWrite(18, HIGH); // ВОССТАНОВЛЕНИЕ РАБОТЫ: Подаем HIGH на аппаратный пин защиты GPIO 18
+  
+  // --- АППАРАТНО ВЫКЛЮЧАЕМ ЗУМЕР НА ПОРТУ А7 ПРИ СБРОСЕ АВАРИИ ---
+  selectI2CChannel(1);
+  Wire.beginTransmission(MCP_ADDR);
+  Wire.write(GPIOA_REG);
+  Wire.write(0x00); // Сбрасываем пин А7 в ноль (0V) -> зумер молчит
+  Wire.endTransmission();
+  selectI2CChannel(0); // Возвращаем мультиплексор на скоростной ADS1115
+  
+  double tempFreq = last_calculated_frequency;
+  if(tempFreq > 0.0) { autoSelectBand(tempFreq); }
+  server.send(200, "text/plain", "Защита сброшена! Усилитель вернулся в рабочий режим.");
+}
+
+void handleSaveExtProto() {
+  if (!server.hasArg("val")) { server.send(400, "text/plain", "Ошибка запроса"); return; }
+  ext_protocol_type = server.arg("val").toInt();
+  prefs.begin("prot", false);
+  prefs.putInt("ext_prot", ext_protocol_type); // Зашиваем во Flash
+  prefs.end();
+  server.send(200, "text/plain", "Протокол связи успешно изменен!");
+}
+
+void handleSaveFanSettings() {
+  if (!server.hasArg("tmin") || !server.hasArg("tmax") || !server.hasArg("pmin")) {
+    server.send(400, "text/plain", "Неполные данные климата"); return;
+  }
+  fan_t_min  = server.arg("tmin").toInt();
+  fan_t_max  = server.arg("tmax").toInt();
+  fan_pct_min = server.arg("pmin").toInt();
+
+  prefs.begin("prot", false);
+  prefs.putInt("f_tmin", fan_t_min); 
+  prefs.putInt("f_tmax", fan_t_max);
+  prefs.putInt("f_pmin", fan_pct_min);
+  prefs.end();
+  server.send(200, "text/plain", "Уставки ШИМ вентилятора успешно сохранены!");
+}
+
+void handleSaveSequencerSettings() {
+  if (!server.hasArg("o_tx") || !server.hasArg("o_rx") || !server.hasArg("b_tx") ||
+      !server.hasArg("b_rx") || !server.hasArg("i_tx") || !server.hasArg("i_rx")) {
+    server.send(400, "text/plain", "Неполные данные матрицы"); return;
+  }
+  seq_rf_out_tx = server.arg("o_tx").toInt(); seq_rf_out_rx = server.arg("o_rx").toInt();
+  seq_bias_tx   = server.arg("b_tx").toInt();  seq_bias_rx   = server.arg("b_rx").toInt();
+  seq_rf_in_tx  = server.arg("i_tx").toInt();  seq_rf_in_rx  = server.arg("i_rx").toInt();
+
+  prefs.begin("prot", false);
+  prefs.putInt("sq_o_tx", seq_rf_out_tx);   prefs.putInt("sq_o_rx", seq_rf_out_rx);
+  prefs.putInt("sq_b_tx", seq_bias_tx);     prefs.putInt("sq_b_rx", seq_bias_rx);
+  prefs.putInt("sq_i_tx", seq_rf_in_tx);     prefs.putInt("sq_i_rx", seq_rf_in_rx);
+  prefs.end();
+  server.send(200, "text/plain", "Матрица задержек успешно обновлена во Flash!");
+}
+
+void handleSelectAntenna() {
+  if (!server.hasArg("id")) { server.send(400, "text/plain", "Ошибка: Нет ID антенны!"); return; }
+  
+  int antId = server.arg("id").toInt();
+  applyAntennaHardware(antId);
+
+  prefs.begin("ant_cfg", false);
+  prefs.putInt("act_ant", active_antenna_id);
+  prefs.end();
+
+  server.send(200, "text/plain", String(active_antenna_id));
+}
+
+void handleGetAntMap() {
+  String response = "";
+  for (int i = 0; i < BAND_COUNT; i++) {
+    if (i > 0) response += ",";
+    response += String(band_antenna_map[i]);
+  }
+  server.send(200, "text/plain", response);
+}
+
+void handleSaveAntMap() {
+  for (int i = 0; i < BAND_COUNT; i++) {
+    String argName = "b" + String(i);
+    if (!server.hasArg(argName.c_str())) {
+      server.send(400, "text/plain", "Неполные данные матрицы антенн"); return;
+    }
+    int ant = server.arg(argName.c_str()).toInt();
+    if (ant < 1 || ant > 4) ant = 1;
+    band_antenna_map[i] = ant;
+  }
+
+  prefs.begin("ant_cfg", false);
+  for (int i = 0; i < BAND_COUNT; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "bmap%d", i);
+    prefs.putInt(key, band_antenna_map[i]);
+  }
+  prefs.end();
+
+  if (current_band_index >= 0) {
+    autoSelectAntennaForBand(current_band_index);
+  }
+
+  server.send(200, "text/plain", "Матрица привязки антенн сохранена!");
+}
+
+void handleSaveWifiSettings() {
+  if (!server.hasArg("ssid") || !server.hasArg("pass")) {
+    server.send(400, "text/plain", "Ошибка: Пустые текстовые поля!"); return;
+  }
+  wifi_ssid_live = server.arg("ssid");
+  wifi_pass_live = server.arg("pass");
+
+  // Намертво зашиваем новые текстовые параметры в постоянную Flash-память
+  prefs.begin("net", false); // Открываем пространство имен "net" в режиме записи
+  prefs.putString("w_ssid", wifi_ssid_live);
+  prefs.putString("w_pass", wifi_pass_live);
+  prefs.end();
+
+  // Выдаем красивый финальный ответ в браузер пользователя
+  server.send(200, "text/plain", "Параметры Wi-Fi изменены! Контроллер уходит в перезагрузку...");
+  delay(1000);
+  ESP.restart(); // Аппаратный перезапуск ESP32-S3 для старта с новой сетью
+}
+
+// НАПОЛНЕНО: Поток данных расширен ровно до 13 параметров (Внедрен wattsPin строго на позицию 13 в конец)
+void handleData() {
+  double mhz = (double)final_frequency / 1000000.0;
+  String wifi_ssid = String(WiFi.SSID());
+  String wifi_ip = WiFi.localIP().toString();
+  long rssi = WiFi.RSSI();
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  char dateBuffer[16];
+  char timeBuffer[16];
+  snprintf(dateBuffer, sizeof(dateBuffer), "%02d.%02d.%04d", timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+  snprintf(timeBuffer, sizeof(timeBuffer), "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+  // Формируем ровно 13 параметров через запятую для JS-парсера (добавлен wattsPin на позицию AUX)
+  String response = String(mhz, 6) + "," + current_band_name + "," + wifi_ssid + "," + wifi_ip + "," + String(rssi) + "," + 
+                    String(dateBuffer) + "," + String(timeBuffer) + "," + String(ext_voltage_vd, 2) + "," + 
+                    String(ext_current_id, 2) + "," + String(ext_temperature, 1) + "," + 
+                    String(is_tripped ? 1 : 0) + "," + trip_reason + "," + String(wattsPin, 1) + "," + 
+                    String(ext_protocol_type) + "," + String(fan_pwm_percent) + "," + String(active_trx_id);
+
+  server.send(200, "text/plain", response); 
+}
+
+// Сетевой обработчик ручной установки времени (СТРОЖАЙШИЙ ЗАПРЕТ НА ИЗМЕНЕНИЯ)
+void handleSetTime() {
+  if (!server.hasArg("d") || !server.hasArg("m") || !server.hasArg("y") || !server.hasArg("h") || !server.hasArg("min") || !server.hasArg("s")) {
+    server.send(400, "text/plain", "Неполные данные времени");
+    return;
+  }
+  struct tm tm_manual;
+  tm_manual.tm_mday = server.arg("d").toInt();
+  tm_manual.tm_mon  = server.arg("m").toInt() - 1; 
+  tm_manual.tm_year = server.arg("y").toInt() - 1900; 
+  tm_manual.tm_hour = server.arg("h").toInt();
+  tm_manual.tm_min  = server.arg("min").toInt();
+  tm_manual.tm_sec  = server.arg("s").toInt();
+  tm_manual.tm_isdst = -1;
+  time_t t = mktime(&tm_manual);
+  if (t == -1) { server.send(200, "text/plain", "Ошибка формат!"); return; }
+  struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+  settimeofday(&tv, NULL); 
+  server.send(200, "text/plain", "Время сохранено!");
+}
+
+// Сетевой обработчик интернет-синхронизации через двойной контур NTP (ВНИИФТРИ + pool.ntp.org)
+void handleSyncNtp() {
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, ntpServer2);
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5000)) { server.send(200, "text/plain", "Синхронизация успешна!"); }
+    else { server.send(200, "text/plain", "Ошибка: Серверы NTP не ответили."); }
+  } else { server.send(200, "text/plain", "Ошибка: Нет Wi-Fi сети!"); }
+}
+
+// Сетевой обработчик кнопок меню калибровки AD8307 (СТРОГИЙ ЗАПРЕТ НА ИЗМЕНЕНИЯ)
+void handleSetCal() {
+  if (!server.hasArg("pt")) { server.send(400, "text/plain", "Неверный запрос"); return; }
+  int point = server.arg("pt").toInt();
+  String msg = "";
+  if (point == 1) {
+    lastVoltPt1 = currentVoltFwdCalibrationSnapshot;
+    msg = "Точка 1 записана: " + String(lastVoltPt1, 4) + " В. Подайте 100 Вт!";
+  } else if (point == 2) {
+    lastVoltPt2 = currentVoltFwdCalibrationSnapshot;
+    if (lastVoltPt2 > lastVoltPt1 && lastVoltPt1 > 0.2f) {
+      processTwoPointCalibration();
+      msg = "Калибровка успешна 500w! Slope: " + String(CAL_AD8307_SLOPE, 5) + " Intercept: " + String(cal_intercepts, 2);
+    } else { msg = "Ошибка! Напряжение Т2 должно быть больше Т1"; }
+  } else { msg = "Неверная точка"; }
+  server.send(200, "text/plain", msg);
+}
+
+// СТРОЖАЙШИЙ ЗАПРЕТ НА ИЗМЕНЕНИЯ: Native-обработчик загрузки бинарного потока прошивки
+void handleUpdateUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial0.printf("Начало OTA обновления: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { Update.printError(Serial0); }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) { Update.printError(Serial0); }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) { Serial0.printf("OTA update success: %u bytes\nRestarting...\n", upload.totalSize); }
+    else { Update.printError(Serial0); }
+  }
+}
+
+void setup() {
+  Serial0.begin(115200); 
+  Serial1.begin(115200, SERIAL_8N1, 18, 17); // Скоростной порт UART1 для Nextion
+  pinMode(18, OUTPUT);
+  digitalWrite(18, HIGH); // По умолчанию подаем HIGH — усилитель разрешен к работе
+  tempSensor.begin();
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
+
+
+
+ 
+  // СТРОГО ОБНОВЛЕНО: Запуск экрана 1602 на общей параллельной системной шине Wire
+  lcd.init(); 
+  lcd.backlight(); // Включаем подсветку экрана
+    // СТРОГО ДОБАВЛЕНО ПО ТЗ: Генерация собственного жирного кубика для бар-линйки
+  byte custom_block[8] = {
+    0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F, 0x1F // Все 8 строчек символа залиты полностью
+  };
+  lcd.createChar(0, custom_block); // Зашиваем кубик под номером 0
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("POWER:   0 W"); // Стартовая заставка при включении УМ
+
+
+
+
+    // --- КОНФИГУРАЦИЯ MCP23017 СТРОГО ПО ДАТАШИТУ SOIC-28 (КАНАЛ 1 МУЛЬТИПЛЕКСОРА) ---
+  selectI2CChannel(1); // Открываем изолированный Канал 1
+  
+  Wire.beginTransmission(MCP_ADDR);
+  Wire.write(IODIRA);
+  // Маска 0x7E (в двоичном виде 01111110): 
+  // Бит 7 (ножка 28, GPA7, Зумер) -> 0 (Выход)
+  // Бит 0 (ножка 21, GPA0, Реле Байпас) -> 0 (Выход)
+  // Бит 1 (ножка 22, GPA1, Кнопка RESET) -> 1 (Вход)
+  // Маска 0x6E: А7(Зумер), А4(BIASS) и А0(Реле Байпас) на ВЫХОД, GPA1(RESET) на ВХОД
+  Wire.write(0x6E); 
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MCP_ADDR);
+  Wire.write(0x0C); // Регистр GPPUA (Встроенные Pull-Up подтяжки Порта А)
+  Wire.write(0x02); // Включаем Pull-Up резистор строго на Бит 1 (ножка 22, GPA1, Кнопка RESET)
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MCP_ADDR);
+  Wire.write(IODIRB);
+  // Маска 0x03 (00000011 в двоичном): 
+  // Бит 0 (ножка 1, GPB0, Вход PTT1) -> 1 (Вход)
+  // Бит 1 (ножка 2, GPB1, Вход PTT2) -> 1 (Вход)
+  // Бит 6 (ножка 7, GPB6, Выход Реле2) и Бит 7 (ножка 8, GPB7, Выход Реле1) -> 0 (Выходы)
+  Wire.write(0x03); 
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MCP_ADDR);
+  Wire.write(GPPUB);
+  Wire.write(0x03); // Включаем Pull-Up резисторы на Бит 0 (ножка 1) и Бит 1 (ножка 2)
+  Wire.endTransmission();
+
+  // СТАРТОВАЯ ИНИЦИАЛИЗАЦИЯ: По умолчанию включаем Реле 1 (ножка 8 / GPB7)
+  Wire.beginTransmission(MCP_ADDR);
+  Wire.write(0x13); // Регистр GPIOB (физические выходы Порта B)
+  Wire.write(0x80); // Выставляем 1 на Бит 7 (ножка 8), остальные в ноль
+  Wire.endTransmission();
+
+
+  Wire.beginTransmission(MCP_ADDR);
+  Wire.write(GPPUB);
+  Wire.write(0x01); // Включаем Pull-Up резистор на Бит 0 (ножка 1, GPB0, Вход PTT)
+  Wire.endTransmission();
+
+  Wire.beginTransmission(MCP_ADDR);
+  Wire.write(GPIOA_REG);
+  Wire.write(0x00); // Инициализация: гасим выходы Порта А (Зумер и Реле выключены)
+  Wire.endTransmission();
+
+  selectI2CChannel(0); // Намертво возвращаем мультиплексор на скоростной Канал 0 (ADS1115)
+
+
+  analogReadResolution(12);
+  pinMode(PIN_595_DATA, OUTPUT); pinMode(PIN_595_CLOCK, OUTPUT); pinMode(PIN_595_LATCH, OUTPUT);
+  digitalWrite(PIN_595_LATCH, LOW);
+  shiftOut(PIN_595_DATA, PIN_595_CLOCK, MSBFIRST, 0x00);
+  digitalWrite(PIN_595_LATCH, HIGH);
+  pinMode(FREQ_INPUT_PIN, INPUT);
+
+// **************************** ЧАСТЬ 6.3 ******************************
+
+  prefs.begin("calib", true); 
+  if (prefs.isKey("slope")) {
+    CAL_AD8307_SLOPE = prefs.getFloat("slope", 0.0250f);
+    cal_intercepts = prefs.getFloat("intercept", -84.0f);
+  }
+  prefs.end();
+
+  prefs.begin("prot", true);
+  lim_id = prefs.getFloat("id", 35.0f); lim_vd = prefs.getFloat("vd", 55.0f);
+  lim_swr = prefs.getFloat("swr", 3.0f); lim_pin = prefs.getFloat("pin", 50.0f);
+  lim_pout = prefs.getFloat("pout", 1200.0f); lim_pref = prefs.getFloat("pref", 100.0f);
+  lim_lpf = prefs.getFloat("lpf", 15.0f); lim_tx_time = prefs.getInt("txtime", 10);
+  lim_temp = prefs.getFloat("temp", 60.0f);
+  ext_protocol_type = prefs.getInt("ext_prot", 0); // Читаем сохраненный протокол
+  fan_t_min  = prefs.getInt("f_tmin", 35);  
+  fan_t_max  = prefs.getInt("f_tmax", 65);
+  fan_pct_min = prefs.getInt("f_pmin", 20);
+
+    // СТРОГО ДОБАВЛЕНО: Автоматическая выгрузка 6 задержек секвенсора из Flash при включении УМ
+  seq_rf_out_tx = prefs.getInt("sq_o_tx", 10);  seq_rf_out_rx = prefs.getInt("sq_o_rx", 30);
+  seq_bias_tx   = prefs.getInt("sq_b_tx", 25);  seq_bias_rx   = prefs.getInt("sq_b_rx", 5);
+  seq_rf_in_tx  = prefs.getInt("sq_i_tx", 15);  seq_rf_in_rx  = prefs.getInt("sq_i_rx", 20);
+  prefs.end();
+
+  // Выгрузка сохранённой матрицы привязки антенн и последней активной антенны
+  prefs.begin("ant_cfg", true);
+  active_antenna_id = prefs.getInt("act_ant", 1);
+  for (int i = 0; i < BAND_COUNT; i++) {
+    char key[8];
+    snprintf(key, sizeof(key), "bmap%d", i);
+    band_antenna_map[i] = prefs.getInt(key, band_antenna_map[i]);
+    if (band_antenna_map[i] < 1 || band_antenna_map[i] > 4) band_antenna_map[i] = 1;
+  }
+  prefs.end();
+
+  applyAntennaHardware(active_antenna_id);
+
+  // Инициализируем аппаратный ШИМ на выводе 14 платы DevKit (Частота 25 кГц — без писка мотора)
+  ledcAttach(14, 25000, 8);
+  ledcWrite(14, 0);
+
+  // Читаем сохраненные параметры Wi-Fi сети из Flash-памяти Preferences
+  prefs.begin("net", true); // Открываем пространство имен "net" в режиме только для чтения
+  wifi_ssid_live = prefs.getString("w_ssid", "Dachnaja 8");
+  wifi_pass_live = prefs.getString("w_pass", "8101966G");
+  prefs.end();
+
+   if (!WiFi.config(local_IP, gateway, subnet)) { Serial0.println("Ошибка статического IP"); }
+
+  // Запускаем подключение строго по живым переменным из Flash
+  WiFi.begin(wifi_ssid_live.c_str(), wifi_pass_live.c_str());
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial0.print("."); }
+  Serial0.println("\nWi-Fi подключен успешно!");
+
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, ntpServer2);
+
+  server.on("/", HTTP_GET, handleRoot); server.on("/data", HTTP_GET, handleData);
+  server.on("/set_cal", HTTP_GET, handleSetCal); server.on("/set_time", HTTP_GET, handleSetTime); 
+  server.on("/sync_ntp", HTTP_GET, handleSyncNtp); server.on("/save_prot", HTTP_GET, handleSaveProt);  
+  server.on("/reset_trip", HTTP_GET, handleResetTrip);
+  server.on("/save_ext_proto", HTTP_GET, handleSaveExtProto);
+  server.on("/save_fan", HTTP_GET, handleSaveFanSettings);
+  server.on("/save_seq", HTTP_GET, handleSaveSequencerSettings);
+  server.on("/set_ant", HTTP_GET, handleSelectAntenna);
+  server.on("/get_ant_map", HTTP_GET, handleGetAntMap);
+  server.on("/save_ant_map", HTTP_GET, handleSaveAntMap);
+  server.on("/save_wifi", HTTP_GET, handleSaveWifiSettings);
+
+  server.on("/toggle_trx", HTTP_GET, []() {
+    active_trx_id = (active_trx_id == 1) ? 2 : 1;
+    
+    // АППАРАТНО ПЕРЕКЛЮЧАЕМ РЕЛЕ КОММУТАЦИИ ВЧ НА ПОРТУ B ПО ДАТАШИТУ
+    selectI2CChannel(1);
+    Wire.beginTransmission(MCP_ADDR);
+    Wire.write(0x13); // Регистр GPIOB (ножки 7 и 8)
+    // Маска 0x80 (Бит 7, ножка 8) -> TRX-1, Маска 0x40 (Бит 6, ножка 7) -> TRX-2
+    Wire.write(active_trx_id == 2 ? 0x40 : 0x80); 
+    Wire.endTransmission();
+    selectI2CChannel(0); // НАМЕРТВО ВОЗВРАЩАЕМ МУЛЬТИПЛЕКСОР НА АЦП ДАТЧИКОВ
+    
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/set_bypass", HTTP_GET, []() {
+    if (server.hasArg("val")) {
+      bypass_state = server.arg("val").toInt();
+      
+      // АППАРАТНОЕ УПРАВЛЕНИЕ РЕЛЕ НА ПОРТУ А (НОЖКА 21) ПО ДАТАШИТУ
+      selectI2CChannel(1);
+      Wire.beginTransmission(MCP_ADDR);
+      Wire.write(GPIOA_REG);
+      
+      uint8_t outMask = 0x00;
+      if (bypass_state)  outMask |= 0x01; // Бит 0 (ножка 21, GPA0) -> 1 (Включить Реле обхода)
+      if (is_tripped)     outMask |= 0x80; // Бит 7 (ножка 28, GPA7) -> 1 (Включить Зумер, если авария)
+      
+      Wire.write(outMask);
+      Wire.endTransmission();
+      selectI2CChannel(0); // Возвращаем шину на ADS1115
+      
+      Serial0.printf("Режим BYPASS изменен: %s\n", bypass_state ? "АКТИВЕН" : "ВЫКЛЮЧЕН");
+    }
+    server.send(200, "text/plain", "OK");
+  });
+
+  server.on("/update", HTTP_POST, []() {
+    server.sendHeader("Connection", "close");
+    server.send(Update.hasError() ? 500 : 200, "text/plain", Update.hasError() ? "FAIL" : "OK");
+    ESP.restart(); 
+  }, handleUpdateUpload);
+  
+  server.on("/fast_data", []() {
+      float binaryBuffer[] = { wattsFwd, wattsRef, swr };
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+      server.send_P(200, "application/octet-stream", (const char*)binaryBuffer, sizeof(binaryBuffer));
+  });
+  
+  server.begin();
+
+  pcnt_unit_config_t unit_config = { .low_limit = -32768, .high_limit = 32767 };
+  ESP_ERROR_CHECK(pcnt_new_unit(&unit_config, &pcnt_unit));
+  pcnt_chan_config_t chan_config = { .edge_gpio_num = FREQ_INPUT_PIN, .level_gpio_num = -1 };
+  ESP_ERROR_CHECK(pcnt_new_channel(pcnt_unit, &chan_config, &pcnt_chan));
+  pcnt_event_callbacks_t cbs = { .on_reach = on_pcnt_overflow };
+  ESP_ERROR_CHECK(pcnt_unit_register_event_callbacks(pcnt_unit, &cbs, NULL));
+  ESP_ERROR_CHECK(pcnt_channel_set_edge_action(pcnt_chan, PCNT_CHANNEL_EDGE_ACTION_INCREASE, PCNT_CHANNEL_EDGE_ACTION_HOLD));
+  ESP_ERROR_CHECK(pcnt_unit_add_watch_point(pcnt_unit, 20000));
+  ESP_ERROR_CHECK(pcnt_unit_enable(pcnt_unit));
+  ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
+  ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
+}
+
+
+void loop() {
+  server.handleClient();
+  
+   // --- АППАРАТНЫЙ МОНИТОР АВАРИЙ И ЗУМЕРА НА НОЖКЕ 28 (GPA7) ПО ДАТАШИТУ ---
+  checkProtectionTrips();
+  static bool lastTripState = false;
+  if (is_tripped != lastTripState) {
+      lastTripState = is_tripped;
+      selectI2CChannel(1);
+      Wire.beginTransmission(MCP_ADDR);
+      Wire.write(GPIOA_REG);
+      
+      uint8_t outMask = 0x00;
+      if (bypass_state) outMask |= 0x01; // Сохраняем состояние реле обхода на ножке 21
+      if (is_tripped)    outMask |= 0x80; // Выставляем плюс строго на ножку 28 (GPA7) при аварии
+      
+      Wire.write(outMask);
+      Wire.endTransmission();
+      selectI2CChannel(0);
+  }
+
+  // Высокоскоростная накопительная пиковая фильтрация встроенного АЦП (каждые 5 мс)
+  static unsigned long lastFastAdcTimer = 0;
+  // СТРОГО ИСПРАВЛЕНО: Возвращен точный размер накопительного массива пиков [20]
+  static float peakBuffer[20]; 
+  static int peakSampleCount = 0;
+  static float rawVoltFwdSaved = 0.0f; static float rawVoltRefSaved = 0.0f;
+
+  if (millis() - lastFastAdcTimer >= 5) {
+      lastFastAdcTimer = millis();
+      int rawFwd = analogRead(PIN_ADC_FWD); int rawRef = analogRead(PIN_ADC_REF);
+      float currentSampleFwd = ((float)rawFwd / 4095.0f) * 3.3f; 
+      float currentSampleRef = ((float)rawRef / 4095.0f) * 3.3f; 
+      currentVoltFwdCalibrationSnapshot = currentSampleFwd;
+      peakBuffer[peakSampleCount] = currentSampleFwd; peakSampleCount++;
+
+      if (currentSampleFwd > rawVoltFwdSaved) { rawVoltFwdSaved = currentSampleFwd; rawVoltRefSaved = currentSampleRef; }
+
+      if (peakSampleCount >= 20) {
+          peakSampleCount = 0; float maxPeakFwdVolt = 0.0f;
+          for (int i = 0; i < 20; i++) { if (peakBuffer[i] > maxPeakFwdVolt) { maxPeakFwdVolt = peakBuffer[i]; } }
+          calculateRfParameters(maxPeakFwdVolt, rawVoltRefSaved);
+          rawVoltFwdSaved = 0.0f; rawVoltRefSaved = 0.0f;
+
+          int nextionVal = (int)constrain(map((long)wattsFwd, 0, 2000, 0, 100), 0, 100);
+          Serial1.print("j0.val="); Serial1.print(nextionVal);
+          Serial1.write(0xFF); Serial1.write(0xFF); Serial1.write(0xFF); 
+      }
+
+        // --- СКОРОСТНОЙ АВТОМАТ MCP23017: ВЗАИМНАЯ БЛОКИРОВКА DUAL-TRX (НОЖКИ 1, 2, 7, 8 ПОРТА B) ---
+      selectI2CChannel(1); // Открываем изолированный Канал 1 мультиплексора
+      
+      Wire.beginTransmission(MCP_ADDR);
+      Wire.write(0x13); // Обращаемся строго к регистру GPIOB (физические пины Порта B)
+      Wire.endTransmission(); // Чистый и безопасный Си-код закрытия кадра I2C
+      
+      Wire.requestFrom(MCP_ADDR, 1);
+      if (Wire.available()) {
+          uint8_t portBValue = Wire.read();
+          
+          // По даташиту SOIC-28: логический ноль на входе означает замыкание педали на землю (TX)
+          ptt1_active = (portBValue & 0x01) == 0; // Ножка 1 (GPB0) -> Сигнал PTT от TRX-1
+          ptt2_active = (portBValue & 0x02) == 0; // Ножка 2 (GPB1) -> Сигнал PTT от TRX-2
+          
+          int oldTrx = active_trx_id;
+          
+          // Автоматическая аппаратная коммутация по приоритету первого нажатия (Interlocking)
+          if (ptt1_active && active_trx_id != 1) { 
+              active_trx_id = 1; 
+          } 
+          else if (ptt2_active && active_trx_id != 2) { 
+              active_trx_id = 2; 
+          }
+          
+          // Если состояние трансиверов изменилось аппаратно от педали — мгновенно переключаем реле Порта B
+          if (active_trx_id != oldTrx) {
+              Wire.beginTransmission(MCP_ADDR);
+              Wire.write(0x13); // Обращаемся к регистру GPIOB
+              // Маска 0x80 (10000000) -> Вкл Реле 1 (ножка 8 / GPB7), Маска 0x40 (01000000) -> Вкл Реле 2 (ножка 7 / GPB6)
+              Wire.write(active_trx_id == 2 ? 0x40 : 0x80); 
+              Wire.endTransmission();
+          }
+
+                    // СТРОЖАЙШЕЕ ВЕТО НА БЛОКИРОВКУ ПЕРЕДАЧИ ЛДМОС (BIASS НА НОЖКЕ 25 / GPA4)
+          // Перевод в режим TX (подача +3.3V смещения на затворы) разрешен только если УМ не в аварии, 
+          // режим BYPASS полностью выключен и нажат PTT именно того аппарата, который сейчас АКТИВЕН!
+          bool current_ptt = (active_trx_id == 2) ? ptt2_active : ptt1_active;
+          
+          if (!is_tripped && bypass_state == 0) {
+              int newBiassState = current_ptt ? 1 : 0;
+              if (newBiassState != biass_state) {
+                  biass_state = newBiassState;
+                  
+                  Wire.beginTransmission(MCP_ADDR);
+                  Wire.write(GPIOA_REG); // СТРОГО ИСПРАВЛЕНО: Возвращен верный системный регистр Порта А
+                  
+                  uint8_t outMask = 0x00;
+                  if (bypass_state) outMask |= 0x01; // Сохраняем Реле Байпас на ножке 21 (GPA0)
+                  if (is_tripped)    outMask |= 0x80; // Сохраняем Зумер на ножке 28 (GPA7)
+                  if (biass_state)   outMask |= 0x10; // Выставляем +3.3V на выход BIASS (ножка 25 / GPA4) при TX
+                  
+                  Wire.write(outMask);
+                  Wire.endTransmission();
+              }
+          } else {
+              // Если сработала защита или нажат экранный обход — принудительно гасим BIASS на ножке 25 (0V)
+              if (biass_state == 1) {
+                  biass_state = 0;
+                  Wire.beginTransmission(MCP_ADDR);
+                  Wire.write(GPIOA_REG); // СТРОГО ИСПРАВЛЕНО: Возвращен верный системный регистр Порта А
+                  uint8_t outMask = 0x00;
+                  if (bypass_state) outMask |= 0x01;
+                  if (is_tripped)    outMask |= 0x80;
+                  Wire.write(outMask); // Бит 4 сбрасывается в ноль -> смещение снято
+                  Wire.endTransmission();
+              }
+          }
+      }
+      
+      selectI2CChannel(0); // Мгновенно возвращаем мультиплексор на скоростной Канал 0 (ADS1115 защит)
+
+  }
+
+  static unsigned long lastExtAdcTimer = 0; static uint8_t adcMuxStep = 0; 
+  if (millis() - lastExtAdcTimer >= 200) {
+      lastExtAdcTimer = millis(); selectI2CChannel(0); 
+      if (adcMuxStep == 0) {
+          Wire.beginTransmission(0x48); Wire.write(0x00); Wire.endTransmission();
+          Wire.requestFrom(0x48, 2);
+          if (Wire.available() >= 2) {
+              int16_t rawAdcValue = (Wire.read() << 8) | Wire.read();
+              float measuredVolts = (float)rawAdcValue * 0.000125f;
+              if (measuredVolts < 0.0f) measuredVolts = 0.0f;
+              ext_voltage_vd = measuredVolts * 17.12903f; 
+          }
+          Wire.beginTransmission(0x48); Wire.write(0x01); Wire.write(0xD2); Wire.write(0x83); Wire.endTransmission();
+          tempSensor.setWaitForConversion(false); tempSensor.requestTemperatures();
+          adcMuxStep = 1;
+      } 
+      else {
+          Wire.beginTransmission(0x48); Wire.write(0x00); Wire.endTransmission();
+          Wire.requestFrom(0x48, 2);
+          if (Wire.available() >= 2) {
+              int16_t rawAdcValue = (Wire.read() << 8) | Wire.read();
+              float measuredVolts = (float)rawAdcValue * 0.000125f;
+              if (measuredVolts < 0.0f) measuredVolts = 0.0f;
+              ext_current_id = measuredVolts * 0.33333f; 
+              if (ext_current_id < 0.01f) ext_current_id = 0.00f; 
+          }
+          float currentTemp = tempSensor.getTempCByIndex(0);
+          if (currentTemp > -50.0f && currentTemp < 125.0f) { ext_temperature = currentTemp; }
+          Wire.beginTransmission(0x48); Wire.write(0x01); Wire.write(0xC2); Wire.write(0x83); Wire.endTransmission();
+          adcMuxStep = 0;
+      }
+  }
+
+  static unsigned long lastPinReadTimer = 0;
+  if (millis() - lastPinReadTimer >= 10) {
+      lastPinReadTimer = millis();
+      int rawPinAdc = analogRead(PIN_ADC_PIN);
+      float voltPinAdc = ((float)rawPinAdc / 4095.0f) * 3.3f;
+      wattsPin = (voltPinAdc / 3.3f) * 100.0f;
+      if (wattsPin < 0.1f) wattsPin = 0.0f;
+      if (wattsPin > 120.0f) wattsPin = 120.0f;
+  }
+
+  static unsigned long last_measurement = 0;
+
+  // --- ПРЕЦИЗИОННЫЙ ТРЕХСТУПЕНЧАТЫЙ АВТОМАТ СЕКВЕНСОРА НА MILLIS() (СТРОГО БЕЗ DELAY) ---
+  // Берём живое, отлаженное состояние педали current_ptt из вашей второй части кода
+  // СТРОГО ИСПРАВЛЕНО: Прямое чтение флага педали активного трансивера вне скобок таймера
+  bool sequencer_ptt_input = (active_trx_id == 2) ? ptt2_active : ptt1_active;
+
+  // Аппаратный замок безопасности: если сработала защита или включен BYPASS — мгновенно блокируем передачу
+  if (is_tripped || bypass_state == 1) { sequencer_ptt_input = false; }
+
+  if (sequencer_ptt_input) {
+      // >>> НАЖАТИЕ ПЕДАЛИ (RX -> TX Переход) <<<
+      if (sequencer_state == 0) { 
+          sequencer_timer = millis();
+          sequencer_state = 1; 
+      }
+      unsigned long elapsed = millis() - sequencer_timer;
+
+      // СТУПЕНЬ 1: Включение выходного мощного реле RF OUTPUT (4 ножка 1-го чипа 74HC595)
+      if (sequencer_state == 1 && elapsed >= (unsigned long)seq_rf_out_tx) {
+          current_32bit_lpf_mask |= BIT_RF_OUTPUT_RELAY;
+          writeRegister595(current_32bit_lpf_mask);
+          sequencer_state = 2;
+      }
+      // СТУПЕНЬ 2: Включение входного реле раскачки RF INPUT (7 ножка 4-го чипа 74HC595)
+      if (sequencer_state == 2 && elapsed >= (unsigned long)seq_rf_in_tx) {
+          current_32bit_lpf_mask |= BIT_RF_INPUT_RELAY;
+          writeRegister595(current_32bit_lpf_mask);
+          sequencer_state = 3;
+      }
+      // СТУПЕНЬ 3: Плавная синхронизация автомата с вашим включением BIASS в Части 2
+      if (sequencer_state == 3 && elapsed >= (unsigned long)seq_bias_tx) {
+          sequencer_state = 4; // Матрица TX полностью собрана, УМ в эфире!
+      }
+  } 
+  else {
+      // >>> ОТПУСКАНИЕ ПЕДАЛИ (TX -> RX Переход) <<<
+      if (sequencer_state == 4 || sequencer_state == 3 || sequencer_state == 2 || sequencer_state == 1) { 
+          sequencer_timer = millis();
+          sequencer_state = 5; // Переходим на первый шаг безопасного разбора ВЧ-тракта реле
+      }
+      
+      if (sequencer_state >= 5) {
+          unsigned long elapsed = millis() - sequencer_timer;
+
+          // СТУПЕНЬ 1: Выдержка времени после мгновенного снятия BIASS в Части 2
+          if (sequencer_state == 5 && elapsed >= (unsigned long)seq_bias_rx) {
+              sequencer_state = 6;
+          }
+          // СТУПЕНЬ 2: Выключение входного реле раскачки RF INPUT (Очищаем бит в 4-м чипе 74HC595)
+          if (sequencer_state == 6 && elapsed >= (unsigned long)seq_rf_in_rx) {
+              current_32bit_lpf_mask &= ~BIT_RF_INPUT_RELAY;
+              writeRegister595(current_32bit_lpf_mask);
+              sequencer_state = 7;
+          }
+          // СТУПЕНЬ 3: Выключение выходного мощного реле RF OUTPUT (Очищаем бит в 1-м чипе 74HC595)
+          if (sequencer_state == 7 && elapsed >= (unsigned long)seq_rf_out_rx) {
+              current_32bit_lpf_mask &= ~BIT_RF_OUTPUT_RELAY;
+              writeRegister595(current_32bit_lpf_mask);
+              sequencer_state = 0; // Возвращаемся в режим RX чистого сна
+          }
+      }
+  }
+
+  // Передаем признак нажатия PTT в ваш оригинальный КВ-частотомер
+  bool is_ptt_pressed = (active_trx_id == 2) ? ptt2_active : ptt1_active;
+  if (is_ptt_pressed) {
+      if (millis() - last_measurement >= GATE_TIME_MS) {
+          int pulse_count = 0; pcnt_unit_get_count(pcnt_unit, &pulse_count);
+          int64_t total_pulses = (pcnt_overflow_count * 20000) + pulse_count;
+          pcnt_overflow_count = 0; pcnt_unit_clear_count(pcnt_unit);
+          unsigned long current_gate = millis() - last_measurement; last_measurement = millis();
+          if (total_pulses < 0) total_pulses = 0;
+
+          if (wattsFwd > 0.5f) {
+              last_calculated_frequency = ((double)total_pulses * 1000.0 / (double)current_gate) * PRESCALER * calibration_factor;
+              final_frequency = (uint32_t)last_calculated_frequency; autoSelectBand(last_calculated_frequency);
+          } else { final_frequency = 0; last_calculated_frequency = 0.0; }
+          double mhz = (double)final_frequency / 1000000.0;
+          Serial0.print("Частота: "); Serial0.print(mhz, 6); Serial0.print(" MHz | Диапазон: "); Serial0.println(current_band_name);
+      }
+  } else {
+      // Если PTT отпущен — сбрасываем таймер замера, чтобы при нажатии он стартовал мгновенно
+      last_measurement = millis(); 
+  }
+
+  // --- АВТОМАТИЧЕСКИЙ РАСЧЕТ И УПРАВЛЕНИЕ ШИМ ВЕНТИЛЯТОРА (DEVKIT ПИН 14) ---
+  static unsigned long lastFanControlTimer = 0;
+  if (millis() - lastFanControlTimer >= 500) { // Корректируем обороты каждые 500 мс, чтобы мотор не дергался
+      lastFanControlTimer = millis();
+      
+      if (ext_temperature < fan_t_min) {
+          fan_pwm_percent = 0; // Температура ниже минимума — вентилятор полностью остановлен
+      } 
+      else if (ext_temperature >= fan_t_max) {
+          fan_pwm_percent = 100; // Температура достигла или превысила максимум — вентилятор на 100%
+      } 
+      else {
+          // Линейная интерполяция: плавно рассчитываем обороты между T_MIN и T_MAX
+          float scale = (ext_temperature - fan_t_min) / (float)(fan_t_max - fan_t_min);
+          fan_pwm_percent = fan_pct_min + (int)(scale * (100 - fan_pct_min));
+          fan_pwm_percent = constrain(fan_pwm_percent, fan_pct_min, 100);
+      }
+      
+      // Пересчитываем проценты (0-100%) в аппаратные биты ШИМ таймера LEDC (0-255 бит)
+      int pwmDuty = map(fan_pwm_percent, 0, 100, 0, 255);
+      ledcWrite(14, pwmDuty); // Физически выдаем ШИМ на вывод 14 платы DevKit
+  }
+
+
+
+
+         
+
+
+        // СТРОГО ОБНОВЛЕНО ПО ТЗ: ДВУХСТРОЧНЫЙ ВЫВОД ЦИФР И ДЛИННОЙ БАР-ЛИНЕЙКИ НА ЭКРАН 1602
+    
+    // ---- СТРОКА 1: ЦИФРОВОЙ ВЫВОД МОЩНОСТИ ----
+    lcd.setCursor(0, 0);
+    lcd.print("POWER: ");
+    if (wattsFwd < 10.0f) {
+        lcd.print("   " + String(wattsFwd, 0) + " W");
+    } else if (wattsFwd < 100.0f) {
+        lcd.print("  " + String(wattsFwd, 0) + " W");
+    } else if (wattsFwd < 1000.0f) {
+        lcd.print(" " + String(wattsFwd, 0) + " W");
+    } else {
+        lcd.print(String(wattsFwd, 0) + " W");
+    }
+
+        // ---- СТРОКА 2: ПОЛНОРАЗМЕРНАЯ АНАЛОГОВАЯ БАР-ЛИНЕЙКА (ПРОВЕРОЧНЫЙ ВАРИАНТ) ----
+    lcd.setCursor(0, 1); // Строго переходим на вторую строчку дисплея
+    
+    // Подстраховка: если лимит мощности во Flash равен 0 или сброшен, берем базовые 1500 Вт
+    float max_scale_power = lim_pout;
+    if (max_scale_power <= 0.0f) {
+        max_scale_power = 1500.0f; 
+    }
+
+    // Прецизионный расчет заполнения шкалы (от 0 до 16 сегментов)
+    int total_segments = 0;
+    if (wattsFwd > 1.0f) {
+        total_segments = (int)((wattsFwd / max_scale_power) * 16.0f);
+        if (total_segments > 16) total_segments = 16; // Ограничитель края экрана
+    }
+
+    // Физически выстреливаем проверочные символы на всю ширину строки
+    for (int i = 0; i < 16; i++) {
+        if (i < total_segments) {
+            lcd.write(0);  // СТРОГО ОБНОВЛЕНО: Выводим красивый, плотный кастомный кубик бар-линейки
+        } else {
+            lcd.print(" ");  // Стираем пустотой старые знаки при падении мощности
+        }
+    }
+
+
+
+
+
+
+
+
+}
