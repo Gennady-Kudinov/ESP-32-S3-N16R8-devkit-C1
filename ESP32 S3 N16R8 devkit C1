@@ -45,8 +45,8 @@ extern const char HTML_BODY_NEW[] PROGMEM;
 
 // Настройки Wi-Fi сети
 // Динамические переменные Wi-Fi сети для чтения и записи во Flash
-String wifi_ssid_live = "Dachnaja 8";
-String wifi_pass_live = "8101966G";
+String wifi_ssid_live = "name id";
+String wifi_pass_live = "pass";
 
 // Настройка статического IP-адреса усилителя
 IPAddress local_IP(192, 168, 0, 123);
