@@ -1129,7 +1129,7 @@ const char HTML_BODY_PART4[] PROGMEM = R"rawliteral(
     </div> 
     <div class='control-box'><div class='icom-btn'>AMP<div id='led-amp' class='btn-led'></div></div><div class='icom-btn'>TUNER<div id='led-tuner' class='btn-led led-active-orange'></div></div><div class='icom-btn'>ANTENNA<div class='btn-led led-active-green'></div></div><div class='icom-btn' onclick="showScreen('menu')" style='border-color:#ff9900; color:#ff9900;'>MENU<div class='btn-led led-active-orange'></div></div><div></div><div class='icom-btn' onclick='toggleBypass()' style='cursor:pointer;'>BYPASS<div id='led-bypass' class='btn-led led-active-orange'></div></div></div>  
   </div>
-  
+ 
   <!-- ================= ЭКРАН 2: СЕТКА МЕНЮ НАСТРОЕК (MENU SCREEN) ================= -->
   <div class='menu-grid' id='menu-scr'>
     <div class='icom-btn' onclick="showScreen('page-seq')">PTT Sequencer</div>
@@ -1348,7 +1348,6 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
 <div class='control-box'>
   <div class='icom-btn'>AMP<div id='led-amp' class='btn-led'></div></div>
   <div class='icom-btn'>TUNER<div id='led-tuner' class='btn-led led-active-orange'></div></div>
-  
   <!-- Блок кнопки ANTENNA с уменьшенными индикаторами -->
   <div class='icom-btn' onclick='cycleAntenna()' style='cursor:pointer; position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center;'>
     ANTENNA
@@ -1359,9 +1358,9 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
       <div id='ant-led4' class='btn-led' style='width: 14%;'></div>
     </div>
   </div>
-  
   <div class='icom-btn' onclick='toggleBypass()' style='cursor:pointer;'>BYPASS<div id='led-bypass' class='btn-led led-active-orange'></div></div>
   <div class='icom-btn' onclick="showScreen('menu')" style='border-color:#ff9900; color:#ff9900; margin-top:auto;'>MENU<div class='btn-led led-active-orange'></div></div>
+</div>
 </div>
 
   <!-- ================= ЭКРАН 2: СЕТКА МЕНЮ НАСТРОЕК (MENU SCREEN) ================= -->
@@ -2155,7 +2154,6 @@ void setup() {
   ESP_ERROR_CHECK(pcnt_unit_clear_count(pcnt_unit));
   ESP_ERROR_CHECK(pcnt_unit_start(pcnt_unit));
 }
-
 
 void loop() {
   server.handleClient();
