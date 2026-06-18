@@ -1,12 +1,7 @@
-//************** RX3PX ****************
-// ************* Gennady **************
-// Telegram   @pa_tuner_1000wt
-// https://rutube.ru/channel/23993242/videos/
-// Max   LDMOS PA CLUB
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>           // СОХРАНЕНО: Стабильный модуль Native Wi-Fi OTA (СТРОГИЙ ЗАПРЕТ НА ПРАВКИ)
+#include <WebSocketsClient.h> // TCI-клиент для связи с Tetis / ExpertSDR (Links2004 WebSockets)
 #include <Wire.h>             // Аппаратная шина I2C для мультиплексора и внешнего АЦП
 
 // --- СТРОГО ОБНОВЛЕНО: ДИСПЛЕЙ 1602 ПОДКЛЮЧЕН ПАРАЛЛЕЛЬНО НА ОСНОВНУЮ ШИНУ I2C ---
@@ -31,6 +26,8 @@ void applyAntennaHardware(int antId);
 void autoSelectAntennaForBand(int bandIdx);
 void calculateRfParameters(float rawVoltFwd, float rawVoltRef);
 void processTwoPointCalibration();
+void tciService();
+void tciHandleCommand(const char* cmd);
 extern float currentVoltFwdCalibrationSnapshot;
 
 // Прототипы монолитных Flash-массивов PROGMEM страницы Icom
@@ -115,6 +112,15 @@ float lim_pref = 100.0f;
 float lim_lpf = 15.0f;      
 int   lim_tx_time = 10;
 int ext_protocol_type = 0; // 0=PCNT, 1=TCI, 2=WOLF, 3=CI-V, 4=YAESU, 5=KENWOOD
+
+// --- TCI (Transceiver Control Interface) — клиент к серверу Tetis / ExpertSDR ---
+WebSocketsClient tciSocket;
+bool tci_connected = false;
+bool tci_socket_started = false;
+String tci_host = "192.168.0.100";
+uint16_t tci_port = 50001;
+unsigned long tci_last_reconnect = 0;
+const unsigned long TCI_RECONNECT_MS = 3000;
 int bypass_state = 0; // 0 = Обход выключен (УМ в тракте), 1 = BYPASS активен (прямой обход)
 int active_trx_id = 1; // 1 = Выбран TRX-1, 2 = Выбран TRX-2
 // СТРОГО ДОБАВЛЕНО: ID активного выхода антенного коммутатора 4-го чипа (1-4)
@@ -374,6 +380,105 @@ void calculateRfParameters(float rawVoltFwd, float rawVoltRef) {
         prefs.end();
     }
 }
+
+// --- TCI: парсинг и обработка команд протокола Expert Electronics ---
+void tciApplyFrequency(uint64_t freqHz) {
+    if (freqHz < 100000ULL || freqHz > 600000000ULL) return;
+    final_frequency = (uint32_t)freqHz;
+    last_calculated_frequency = (double)freqHz;
+    autoSelectBand(last_calculated_frequency);
+}
+
+void tciHandleCommand(const char* cmd) {
+    if (cmd == NULL || cmd[0] == '\0') return;
+
+    if (strncasecmp(cmd, "vfo:", 4) == 0) {
+        const char* lastComma = strrchr(cmd, ',');
+        if (lastComma != NULL) {
+            uint64_t freqHz = strtoull(lastComma + 1, NULL, 10);
+            tciApplyFrequency(freqHz);
+        }
+    } else if (strncasecmp(cmd, "if:", 3) == 0) {
+        const char* lastComma = strrchr(cmd, ',');
+        if (lastComma != NULL) {
+            uint64_t freqHz = strtoull(lastComma + 1, NULL, 10);
+            tciApplyFrequency(freqHz);
+        }
+    } else if (strncasecmp(cmd, "tx_frequency:", 13) == 0) {
+        uint64_t freqHz = strtoull(cmd + 13, NULL, 10);
+        tciApplyFrequency(freqHz);
+    }
+}
+
+void tciParseBuffer(const char* data, size_t length) {
+    if (data == NULL || length == 0) return;
+    char line[160];
+    size_t linePos = 0;
+
+    for (size_t i = 0; i < length; i++) {
+        char c = data[i];
+        if (c == ';') {
+            if (linePos > 0) {
+                line[linePos] = '\0';
+                tciHandleCommand(line);
+                linePos = 0;
+            }
+        } else if (c >= 32 && c <= 126 && linePos < sizeof(line) - 1) {
+            line[linePos++] = c;
+        }
+    }
+}
+
+void tciOnEvent(WStype_t type, uint8_t* payload, size_t length) {
+    switch (type) {
+        case WStype_DISCONNECTED:
+            tci_connected = false;
+            Serial0.println("[TCI] Disconnected");
+            break;
+        case WStype_CONNECTED:
+            tci_connected = true;
+            Serial0.printf("[TCI] Connected to %s:%u\n", tci_host.c_str(), tci_port);
+            tciSocket.sendTXT("vfo:0;");
+            break;
+        case WStype_TEXT:
+            if (payload != NULL && length > 0) {
+                tciParseBuffer((const char*)payload, length);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void tciDisconnect() {
+    if (tci_socket_started) {
+        tciSocket.disconnect();
+        tci_socket_started = false;
+    }
+    tci_connected = false;
+}
+
+void tciService() {
+    if (ext_protocol_type != 1) {
+        if (tci_socket_started || tci_connected) tciDisconnect();
+        return;
+    }
+
+    if (!tci_socket_started) {
+        if (millis() - tci_last_reconnect >= TCI_RECONNECT_MS) {
+            tci_last_reconnect = millis();
+            tciSocket.begin(tci_host.c_str(), tci_port, "/");
+            tciSocket.onEvent(tciOnEvent);
+            tciSocket.setReconnectInterval(TCI_RECONNECT_MS);
+            tci_socket_started = true;
+            Serial0.printf("[TCI] Connecting to ws://%s:%u ...\n", tci_host.c_str(), tci_port);
+        }
+        return;
+    }
+
+    tciSocket.loop();
+}
+
 // ВОССТАНОВЛЕНО: Константный монолитный массив во Flash-памяти для хранения стилей (PROGMEM)
 const char HTML_STYLES[] PROGMEM = R"rawliteral(
 <style>
@@ -389,7 +494,7 @@ body { font-family: Arial, sans-serif; background: #070709; color: #dcdce2; text
 .meter-scale-labels { display: flex; justify-content: space-between; font-size: 0.65rem; color: #5c5e66; font-family: monospace; margin-top: 2px; }
 .bar-container { display: flex; gap: 1px; background: #08090c; padding: 2px; height: 12px; border: 1px solid #1c1d24; }
 .bar-segment { flex: 1; background: #14161d; border-radius: 1px; transition: background 0.05s ease; }
-.main-grid { display: grid; grid-template-columns: 3.5fr 3fr 4.5fr; gap: 12px; margin-top: 15px; }
+.main-grid { display: grid; grid-template-columns: 1fr minmax(200px, 1.6fr) 68px; gap: 12px; margin-top: 15px; align-items: stretch; }
 .left-display-column { display: flex; flex-direction: column; gap: 12px; }
 .freq-box, .wifi-box { background: #000000; border: 2px solid #23252d; border-radius: 4px; padding: 10px 6px; display: flex; flex-direction: column; justify-content: center; align-items: center; box-shadow: inset 0 0 15px rgba(255,153,0,0.05); height: 85px; box-sizing: border-box; overflow: hidden; }
 
@@ -431,13 +536,13 @@ body { font-family: Arial, sans-serif; background: #070709; color: #dcdce2; text
 .band-title { font-size: 0.75rem; color: #ff9900; font-weight: bold; margin-top: 4px; letter-spacing: 1px; text-transform: uppercase; }
 .wifi-title { font-size: 0.65rem; color: #00ff66; font-weight: bold; align-self: flex-start; margin-bottom: 3px; letter-spacing: 1px; }
 .wifi-detail { font-size: 0.65rem; color: #ffffff; font-family: 'Courier New', monospace; width: 100%; text-align: left; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.telemetry-box { background: #000000; border: 2px solid #23252d; border-radius: 4px; display: flex; flex-direction: column; height: 182px; box-sizing: border-box; box-shadow: inset 0 0 15px rgba(0,255,102,0.02); overflow: hidden; }
-.tel-row { flex: 1; display: flex; align-items: center; justify-content: space-between; padding: 0 8px; border-bottom: 1px solid #14161d; font-family: 'Courier New', monospace; font-size: 0.75rem; font-weight: bold; }
-.tel-row:last-child { border-bottom: none; } .tel-lbl { color: #8e8e9f; font-size: 0.7rem; } .tel-val { color: #ffffff; }
-.mini-bar-container { display: flex; gap: 1px; background: #08090c; padding: 1px; height: 8px; width: 45px; border: 1px solid #1c1d24; margin: 0 4px; }
+.telemetry-box { background: #000000; border: 2px solid #23252d; border-radius: 4px; display: flex; flex-direction: column; min-height: 267px; box-sizing: border-box; box-shadow: inset 0 0 15px rgba(0,255,102,0.02); overflow: hidden; }
+.tel-row { flex: 1; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-bottom: 1px solid #14161d; font-family: 'Courier New', monospace; font-size: 0.75rem; font-weight: bold; gap: 8px; min-height: 48px; }
+.tel-row:last-child { border-bottom: none; } .tel-lbl { color: #8e8e9f; font-size: 0.7rem; flex-shrink: 0; min-width: 52px; } .tel-val { color: #ffffff; flex-shrink: 0; min-width: 58px; text-align: right; }
+.mini-bar-container { display: flex; gap: 1px; background: #08090c; padding: 2px; height: 10px; flex: 1; min-width: 80px; border: 1px solid #1c1d24; margin: 0; }
 .mini-segment { flex: 1; background: #14161d; border-radius: 0.5px; transition: background 0.05s ease; }
-.control-box { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 85px 85px 85px; gap: 12px 10px; }
-.icom-btn { background: linear-gradient(180deg, #282a35 0%, #181921 100%); border: 1px solid #3d4150; border-radius: 4px; color: #ffffff; font-size: 0.75rem; font-weight: bold; height: 85px; box-sizing: border-box; text-align: center; cursor: pointer; text-transform: uppercase; letter-spacing: 1px; box-shadow: 0 2px 4px rgba(0,0,0,0.4); display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.control-box { display: flex; flex-direction: column; gap: 6px; justify-content: flex-start; height: 100%; min-height: 267px; }
+.icom-btn { background: linear-gradient(180deg, #282a35 0%, #181921 100%); border: 1px solid #3d4150; border-radius: 4px; color: #ffffff; font-size: 0.62rem; font-weight: bold; height: 48px; min-height: 48px; box-sizing: border-box; text-align: center; cursor: pointer; text-transform: uppercase; letter-spacing: 0.5px; box-shadow: 0 2px 4px rgba(0,0,0,0.4); display: flex; flex-direction: column; align-items: center; justify-content: center; flex-shrink: 0; }
 .icom-btn:active { background: #111217; border-color: #222; } .btn-led { width: 16px; height: 4px; background: #444; margin-top: 5px; border-radius: 1px; }
 .led-active-green { background: #00ff66; box-shadow: 0 0 8px #00ff66; } .led-active-orange { background: #ff9900; box-shadow: 0 0 8px #ff9900; }
 .menu-grid { display: none; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 15px; }
@@ -558,8 +663,25 @@ function resetTrip() {
       let val = document.getElementById('sel-proto').value;
       fetch('/save_ext_proto?val=' + val).then(r => r.text()).then(msg => { 
         alert(msg); 
-        window.selProtoInitialized = false; // Позволяем обновить статус на экране
+        window.selProtoInitialized = false;
       });
+    }
+
+    function saveTciSettings() {
+      let p = new URLSearchParams();
+      p.append('host', document.getElementById('tci-host').value);
+      p.append('port', document.getElementById('tci-port').value);
+      fetch('/save_tci?' + p.toString()).then(r => r.text()).then(msg => { alert(msg); });
+    }
+
+    function fillMiniBar(barId, segCount, color) {
+      let box = document.getElementById(barId);
+      if (!box) return;
+      let segs = box.getElementsByClassName('mini-segment');
+      for (let i = 0; i < segs.length; i++) {
+        segs[i].style.background = (i < segCount) ? color : '#14161d';
+        segs[i].style.boxShadow = (i < segCount && color === '#ff9900') ? '0 0 4px #ff9900' : 'none';
+      }
     }
 
     function toggleBypass() {
@@ -768,13 +890,15 @@ if (trxLabel) {
 
     let ampVal = parseFloat(parts[8]);
     document.getElementById('val-id').innerText = ampVal.toFixed(2) + ' A';
-    let segCount = Math.round((ampVal / 1.0) * 10);
-    if (segCount > 10) segCount = 10; if (segCount < 0) segCount = 0;
-    const mCells = document.getElementById('mb-id').getElementsByClassName('mini-segment');
-    for (let i = 0; i < 10; i++) { mCells[i].style.background = (i < segCount) ? '#ffaa00' : '#14161d'; }
+    let segCount = Math.round((ampVal / 35.0) * 16);
+    if (segCount > 16) segCount = 16; if (segCount < 0) segCount = 0;
+    fillMiniBar('mb-id', segCount, '#ffaa00');
     
     let tVal = parseFloat(parts[9]);
     document.getElementById('val-temp').innerText = (tVal <= -127.0) ? 'ERR' : tVal.toFixed(1) + '°C';
+    let segTemp = Math.round(((tVal - 25.0) / 50.0) * 16);
+    if (segTemp > 16) segTemp = 16; if (segTemp < 0) segTemp = 0;
+    fillMiniBar('mb-temp', segTemp, '#ffaa00');
     
     let isTripped = parseInt(parts[10]);
     let reasonStr = parts[11];
@@ -783,10 +907,14 @@ if (trxLabel) {
     
     let pinVal = parseFloat(parts[12]);
     document.getElementById('val-pin').innerText = pinVal.toFixed(1) + ' W';
-    let segPin = Math.round((pinVal / 100.0) * 10);
-    if (segPin > 10) segPin = 10; if (segPin < 0) segPin = 0;
-    const pCells = document.getElementById('mb-pin').getElementsByClassName('mini-segment');
-    for (let i = 0; i < 10; i++) { pCells[i].style.background = (i < segPin) ? '#ffaa00' : '#14161d'; }
+    let segPin = Math.round((pinVal / 100.0) * 16);
+    if (segPin > 16) segPin = 16; if (segPin < 0) segPin = 0;
+    fillMiniBar('mb-pin', segPin, '#ffaa00');
+
+    let vdVal = parseFloat(parts[7]);
+    let segVd = Math.round((vdVal / 60.0) * 16);
+    if (segVd > 16) segVd = 16; if (segVd < 0) segVd = 0;
+    fillMiniBar('mb-vd', segVd, '#00ff66');
     
     let pType = parseInt(parts[13]);
     let pNames = [
@@ -803,21 +931,33 @@ if (trxLabel) {
  // Выводим имя протокола в синее окно на Главном экране
  document.getElementById('ext-proto').innerText = activeName;
 
-     // ПРЕЦИЗИОННОЕ ИСПРАВЛЕНИЕ: Читаем строго 14-ю ячейку массива телеметрии
     let fanPwm = parseInt(parts[14]) || 0;
     document.getElementById('val-fan-pwm').innerText = fanPwm + '%';
-    
-    // Рассчитываем, сколько из 10 светодиодных кубиков нужно зажечь неоном
-    let fanSegments = Math.round(fanPwm / 10);
-    let fanBox = document.getElementById('mb-fan-pwm');
-    if (fanBox) {
-        let segs = fanBox.getElementsByClassName('mini-segment');
-        for (let i = 0; i < segs.length; i++) {
+    let fanSegments = Math.round((fanPwm / 100.0) * 16);
+    fillMiniBar('mb-fan-pwm', fanSegments, '#ff9900');
 
-            // Закрашиваем активные сегменты фирменным оранжевым цветом раскачки, остальные тушим (темно-серые)
-            segs[i].style.background = (i < fanSegments) ? '#ff9900' : '#1a1c23';
-            segs[i].style.boxShadow = (i < fanSegments) ? '0 0 4px #ff9900' : 'none';
-        }
+    let tciLink = parseInt(parts[16]) || 0;
+    let extLink = document.getElementById('ext-link');
+    if (extLink) {
+      if (pType === 1) {
+        extLink.innerText = tciLink ? 'LINK: CONNECTED' : 'LINK: DISCONNECTED';
+        extLink.style.color = tciLink ? '#00ff66' : '#ff3333';
+      } else {
+        extLink.innerText = 'LINK: N/A';
+        extLink.style.color = '#8e8e9f';
+      }
+    }
+    if (document.getElementById('stat-t')) {
+      if (pType === 1) {
+        document.getElementById('stat-t').innerText = tciLink ? 'CONNECTED' : 'DISCONNECTED';
+        document.getElementById('stat-t').style.color = tciLink ? '#00ff66' : '#ff3333';
+      }
+    }
+    if (parts.length > 17 && document.getElementById('tci-host')) {
+      document.getElementById('tci-host').value = parts[17];
+    }
+    if (parts.length > 18 && document.getElementById('tci-port')) {
+      document.getElementById('tci-port').value = parts[18];
     }
 
  // Выводим имя протокола в статусную строку внутри папки настроек
@@ -1165,49 +1305,65 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
 
     </div>
     
-    <!-- ЦЕНТРАЛЬНЫЙ БЛОК ПРИБОРОВ: P IN полностью сохранен на месте AUX (ВЕТО) -->
+    <!-- ЦЕНТРАЛЬНЫЙ БЛОК ПРИБОРОВ: расширенные бар-линейки Id, Temp, P IN, Vd, FAN ШИМ -->
     <div class='telemetry-box'>
       <div class='tel-row'>
         <span class='tel-lbl'>Id:</span>
         <div class='mini-bar-container' id='mb-id'>
-          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
         </div>
         <span class='tel-val' id='val-id'>0.00 A</span>
       </div>
-      <div class='tel-row'><span class='tel-lbl'>TEMP:</span><span class='tel-val' id='val-temp'>25°C</span></div>
+      <div class='tel-row'>
+        <span class='tel-lbl'>TEMP:</span>
+        <div class='mini-bar-container' id='mb-temp'>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+        </div>
+        <span class='tel-val' id='val-temp'>25°C</span>
+      </div>
       <div class='tel-row'>
         <span class='tel-lbl'>P IN:</span>
         <div class='mini-bar-container' id='mb-pin'>
-          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
         </div>
         <span class='tel-val' id='val-pin'>0.0 W</span>
       </div>
-      <div class='tel-row' style='color:#00ff66;'><span class='tel-lbl' style='color:#00ff66;'>Vd:</span><span class='tel-val' id='val-vd' style='color:#00ff66;'>0.00 V</span></div>
-      <div class='tel-row' onclick="showScreen('page-fan')" style='cursor:pointer; border-top:1px solid #14161d; padding-top:4px;'><span class='tel-lbl'>FAN ШИМ:</span><div class='mini-bar-container' id='mb-fan-pwm'><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div></div><span class='tel-val' id='val-fan-pwm'>0%</span></div>
+      <div class='tel-row' style='color:#00ff66;'>
+        <span class='tel-lbl' style='color:#00ff66;'>Vd:</span>
+        <div class='mini-bar-container' id='mb-vd'>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+        </div>
+        <span class='tel-val' id='val-vd' style='color:#00ff66;'>0.00 V</span>
+      </div>
+      <div class='tel-row' onclick="showScreen('page-fan')" style='cursor:pointer; border-top:1px solid #14161d;'>
+        <span class='tel-lbl'>FAN ШИМ:</span>
+        <div class='mini-bar-container' id='mb-fan-pwm'>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+        </div>
+        <span class='tel-val' id='val-fan-pwm'>0%</span>
+      </div>
     </div>
     
-    <div class='control-box'>
-      <div class='icom-btn'>AMP<div id='led-amp' class='btn-led'></div></div>
-      <div class='icom-btn'>TUNER<div id='led-tuner' class='btn-led led-active-orange'></div></div>
-
-      <!-- СТРОГО ОБНОВЛЕНО ПО ТЗ: Интерактивная плитка ANTENNA с циклическим шагом и 4-мя неоновыми индикаторами -->
-      <div class='icom-btn' onclick='cycleAntenna()' style='cursor:pointer; position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center;'>
-        ANTENNA
-        <!-- Ряд из 4-х индикаторов по вашему заводскому стилю (по умолчанию горит 1-й) -->
-        <div style='display:flex; gap:4px; margin-top:5px;'>
-          <div id='ant-led1' class='btn-led led-active-green'></div>
-          <div id='ant-led2' class='btn-led'></div>
-          <div id='ant-led3' class='btn-led'></div>
-          <div id='ant-led4' class='btn-led'></div>
-        </div>
-      </div>
-
-      <div class='icom-btn' onclick="showScreen('menu')" style='border-color:#ff9900; color:#ff9900;'>MENU<div class='btn-led led-active-orange'></div></div>
-      <div></div>
-      <div class='icom-btn' onclick='toggleBypass()' style='cursor:pointer;'>BYPASS<div id='led-bypass' class='btn-led led-active-orange'></div></div>
+<!-- Кнопки управления: вертикально справа (AMP → Tuner → Antenna → Bypass → Menu) -->
+<div class='control-box'>
+  <div class='icom-btn'>AMP<div id='led-amp' class='btn-led'></div></div>
+  <div class='icom-btn'>TUNER<div id='led-tuner' class='btn-led led-active-orange'></div></div>
+  
+  <!-- Блок кнопки ANTENNA с уменьшенными индикаторами -->
+  <div class='icom-btn' onclick='cycleAntenna()' style='cursor:pointer; position:relative; display:flex; flex-direction:column; align-items:center; justify-content:center;'>
+    ANTENNA
+    <div style='display:flex; gap:3px; margin-top:3px; width: 100%; justify-content:center;'>
+      <div id='ant-led1' class='btn-led led-active-green' style='width: 14%;'></div>
+      <div id='ant-led2' class='btn-led' style='width: 14%;'></div>
+      <div id='ant-led3' class='btn-led' style='width: 14%;'></div>
+      <div id='ant-led4' class='btn-led' style='width: 14%;'></div>
     </div>
   </div>
   
+  <div class='icom-btn' onclick='toggleBypass()' style='cursor:pointer;'>BYPASS<div id='led-bypass' class='btn-led led-active-orange'></div></div>
+  <div class='icom-btn' onclick="showScreen('menu')" style='border-color:#ff9900; color:#ff9900; margin-top:auto;'>MENU<div class='btn-led led-active-orange'></div></div>
+</div>
+
   <!-- ================= ЭКРАН 2: СЕТКА МЕНЮ НАСТРОЕК (MENU SCREEN) ================= -->
   <div class='menu-grid' id='menu-scr'>
     <div class='icom-btn' onclick="showScreen('page-seq')">PTT Sequencer</div>
@@ -1376,12 +1532,22 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
       <div style='font-size:0.65rem; color:#5c5e66; margin-bottom:8px;'>Select primary method for tracking transceiver band & frequency</div>
       <select id='sel-proto' class='time-input' style='width:100%; text-align:left; padding-left:10px; font-size:0.8rem; height:32px; box-sizing:border-box;'>
         <option value='0' selected>0 - RESERVED HARDWARE COUNTER (PCNT)</option>
-        <option value='1'>1 - EXPERT ELECTRONICS TCI (WI-FI)</option>
+        <option value='1'>1 - EXPERT ELECTRONICS TCI (WI-FI / Tetis)</option>
         <option value='2'>2 - DDC/DUC WOLF CAT (TS-2000 VIA USB)</option>
         <option value='3'>3 - ICOM CI-V PROTOCOL (REMOTE BUS)</option>
         <option value='4'>4 - YAESU CAT PROTOCOL (4800-38400 BPS)</option>
         <option value='5'>5 - KENWOOD CAT PROTOCOL (TS-SERIES)</option>
       </select>
+    </div>
+
+    <div style='text-align:left; width:85%; max-width:400px; margin:0 auto 20px auto;'>
+      <div style='font-size:0.75rem; color:#4a86e8; font-weight:bold; margin-bottom:5px; letter-spacing:1px;'>TCI SERVER (Tetis / ExpertSDR)</div>
+      <div style='font-size:0.65rem; color:#5c5e66; margin-bottom:8px;'>IP ПК с программой Tetis и порт TCI (обычно 50001)</div>
+      <div style='display:flex; gap:8px; margin-bottom:8px;'>
+        <input type='text' id='tci-host' class='time-input' placeholder='192.168.0.100' style='flex:1; box-sizing:border-box; padding-left:10px; font-size:0.8rem; height:32px; font-family:monospace;'>
+        <input type='text' id='tci-port' class='time-input' value='50001' style='width:72px; box-sizing:border-box; font-size:0.8rem; height:32px; font-family:monospace;'>
+      </div>
+      <button class='prot-action-btn' onclick='saveTciSettings()' style='border-color:#4a86e8; color:#4a86e8; width:100%;'>SAVE TCI SERVER</button>
     </div>
 
     <div style='display:flex; justify-content:space-between; width:85%; max-width:400px; margin:0 auto; gap:10px;'>
@@ -1544,9 +1710,29 @@ void handleSaveExtProto() {
   if (!server.hasArg("val")) { server.send(400, "text/plain", "Ошибка запроса"); return; }
   ext_protocol_type = server.arg("val").toInt();
   prefs.begin("prot", false);
-  prefs.putInt("ext_prot", ext_protocol_type); // Зашиваем во Flash
+  prefs.putInt("ext_prot", ext_protocol_type);
   prefs.end();
+  tciDisconnect();
+  tci_last_reconnect = 0;
   server.send(200, "text/plain", "Протокол связи успешно изменен!");
+}
+
+void handleSaveTciSettings() {
+  if (!server.hasArg("host") || !server.hasArg("port")) {
+    server.send(400, "text/plain", "Неполные данные TCI"); return;
+  }
+  tci_host = server.arg("host");
+  tci_port = (uint16_t)server.arg("port").toInt();
+  if (tci_port == 0) tci_port = 50001;
+
+  prefs.begin("tci", false);
+  prefs.putString("host", tci_host);
+  prefs.putUShort("port", tci_port);
+  prefs.end();
+
+  tciDisconnect();
+  tci_last_reconnect = 0;
+  server.send(200, "text/plain", "TCI сервер сохранён! Переподключение...");
 }
 
 void handleSaveFanSettings() {
@@ -1668,7 +1854,8 @@ void handleData() {
                     String(dateBuffer) + "," + String(timeBuffer) + "," + String(ext_voltage_vd, 2) + "," + 
                     String(ext_current_id, 2) + "," + String(ext_temperature, 1) + "," + 
                     String(is_tripped ? 1 : 0) + "," + trip_reason + "," + String(wattsPin, 1) + "," + 
-                    String(ext_protocol_type) + "," + String(fan_pwm_percent) + "," + String(active_trx_id);
+                    String(ext_protocol_type) + "," + String(fan_pwm_percent) + "," + String(active_trx_id) + "," +
+                    String(tci_connected ? 1 : 0) + "," + tci_host + "," + String(tci_port);
 
   server.send(200, "text/plain", response); 
 }
@@ -1847,6 +2034,11 @@ void setup() {
   seq_rf_in_tx  = prefs.getInt("sq_i_tx", 15);  seq_rf_in_rx  = prefs.getInt("sq_i_rx", 20);
   prefs.end();
 
+  prefs.begin("tci", true);
+  tci_host = prefs.getString("host", "192.168.0.100");
+  tci_port = prefs.getUShort("port", 50001);
+  prefs.end();
+
   // Выгрузка сохранённой матрицы привязки антенн и последней активной антенны
   prefs.begin("ant_cfg", true);
   active_antenna_id = prefs.getInt("act_ant", 1);
@@ -1872,10 +2064,18 @@ void setup() {
 
    if (!WiFi.config(local_IP, gateway, subnet)) { Serial0.println("Ошибка статического IP"); }
 
-  // Запускаем подключение строго по живым переменным из Flash
+  // Запускаем подключение строго по живым переменным из Flash (таймаут 30 с, без блокировки навсегда)
   WiFi.begin(wifi_ssid_live.c_str(), wifi_pass_live.c_str());
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial0.print("."); }
-  Serial0.println("\nWi-Fi подключен успешно!");
+  unsigned long wifiStartMs = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - wifiStartMs < 30000)) {
+    delay(100);
+    yield();
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial0.println("\nWi-Fi подключен успешно!");
+  } else {
+    Serial0.println("\nWi-Fi: таймаут, продолжаем без сети");
+  }
 
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, ntpServer2);
 
@@ -1884,6 +2084,7 @@ void setup() {
   server.on("/sync_ntp", HTTP_GET, handleSyncNtp); server.on("/save_prot", HTTP_GET, handleSaveProt);  
   server.on("/reset_trip", HTTP_GET, handleResetTrip);
   server.on("/save_ext_proto", HTTP_GET, handleSaveExtProto);
+  server.on("/save_tci", HTTP_GET, handleSaveTciSettings);
   server.on("/save_fan", HTTP_GET, handleSaveFanSettings);
   server.on("/save_seq", HTTP_GET, handleSaveSequencerSettings);
   server.on("/set_ant", HTTP_GET, handleSelectAntenna);
@@ -1958,6 +2159,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  tciService();
   
    // --- АППАРАТНЫЙ МОНИТОР АВАРИЙ И ЗУМЕРА НА НОЖКЕ 28 (GPA7) ПО ДАТАШИТУ ---
   checkProtectionTrips();
@@ -2186,26 +2388,27 @@ void loop() {
       }
   }
 
-  // Передаем признак нажатия PTT в ваш оригинальный КВ-частотомер
-  bool is_ptt_pressed = (active_trx_id == 2) ? ptt2_active : ptt1_active;
-  if (is_ptt_pressed) {
-      if (millis() - last_measurement >= GATE_TIME_MS) {
-          int pulse_count = 0; pcnt_unit_get_count(pcnt_unit, &pulse_count);
-          int64_t total_pulses = (pcnt_overflow_count * 20000) + pulse_count;
-          pcnt_overflow_count = 0; pcnt_unit_clear_count(pcnt_unit);
-          unsigned long current_gate = millis() - last_measurement; last_measurement = millis();
-          if (total_pulses < 0) total_pulses = 0;
+  // Передаем признак нажатия PTT в КВ-частотомер (PCNT) — только если активен протокол PCNT
+  if (ext_protocol_type == 0) {
+    bool is_ptt_pressed = (active_trx_id == 2) ? ptt2_active : ptt1_active;
+    if (is_ptt_pressed) {
+        if (millis() - last_measurement >= GATE_TIME_MS) {
+            int pulse_count = 0; pcnt_unit_get_count(pcnt_unit, &pulse_count);
+            int64_t total_pulses = (pcnt_overflow_count * 20000) + pulse_count;
+            pcnt_overflow_count = 0; pcnt_unit_clear_count(pcnt_unit);
+            unsigned long current_gate = millis() - last_measurement; last_measurement = millis();
+            if (total_pulses < 0) total_pulses = 0;
 
-          if (wattsFwd > 0.5f) {
-              last_calculated_frequency = ((double)total_pulses * 1000.0 / (double)current_gate) * PRESCALER * calibration_factor;
-              final_frequency = (uint32_t)last_calculated_frequency; autoSelectBand(last_calculated_frequency);
-          } else { final_frequency = 0; last_calculated_frequency = 0.0; }
-          double mhz = (double)final_frequency / 1000000.0;
-          Serial0.print("Частота: "); Serial0.print(mhz, 6); Serial0.print(" MHz | Диапазон: "); Serial0.println(current_band_name);
-      }
-  } else {
-      // Если PTT отпущен — сбрасываем таймер замера, чтобы при нажатии он стартовал мгновенно
-      last_measurement = millis(); 
+            if (wattsFwd > 0.5f) {
+                last_calculated_frequency = ((double)total_pulses * 1000.0 / (double)current_gate) * PRESCALER * calibration_factor;
+                final_frequency = (uint32_t)last_calculated_frequency; autoSelectBand(last_calculated_frequency);
+            } else { final_frequency = 0; last_calculated_frequency = 0.0; }
+            double mhz = (double)final_frequency / 1000000.0;
+            Serial0.print("Частота: "); Serial0.print(mhz, 6); Serial0.print(" MHz | Диапазон: "); Serial0.println(current_band_name);
+        }
+    } else {
+        last_measurement = millis(); 
+    }
   }
 
   // --- АВТОМАТИЧЕСКИЙ РАСЧЕТ И УПРАВЛЕНИЕ ШИМ ВЕНТИЛЯТОРА (DEVKIT ПИН 14) ---
@@ -2231,57 +2434,31 @@ void loop() {
       ledcWrite(14, pwmDuty); // Физически выдаем ШИМ на вывод 14 платы DevKit
   }
 
+        // СТРОГО ОБНОВЛЕНО: двухстрочный вывод на LCD 1602 — обновление не чаще 100 мс (снижение нагрузки на loop)
+    static unsigned long lastLcdUpdate = 0;
+    static int lastLcdWatts = -1;
+    int curWatts = (int)wattsFwd;
+    if (millis() - lastLcdUpdate >= 100 || abs(curWatts - lastLcdWatts) >= 3) {
+      lastLcdUpdate = millis();
+      lastLcdWatts = curWatts;
 
+      char lcdBuf[20];
+      lcd.setCursor(0, 0);
+      lcd.print("POWER: ");
+      snprintf(lcdBuf, sizeof(lcdBuf), "%4d W", curWatts);
+      lcd.print(lcdBuf);
 
-
-         
-
-
-        // СТРОГО ОБНОВЛЕНО ПО ТЗ: ДВУХСТРОЧНЫЙ ВЫВОД ЦИФР И ДЛИННОЙ БАР-ЛИНЕЙКИ НА ЭКРАН 1602
-    
-    // ---- СТРОКА 1: ЦИФРОВОЙ ВЫВОД МОЩНОСТИ ----
-    lcd.setCursor(0, 0);
-    lcd.print("POWER: ");
-    if (wattsFwd < 10.0f) {
-        lcd.print("   " + String(wattsFwd, 0) + " W");
-    } else if (wattsFwd < 100.0f) {
-        lcd.print("  " + String(wattsFwd, 0) + " W");
-    } else if (wattsFwd < 1000.0f) {
-        lcd.print(" " + String(wattsFwd, 0) + " W");
-    } else {
-        lcd.print(String(wattsFwd, 0) + " W");
+      lcd.setCursor(0, 1);
+      float max_scale_power = lim_pout;
+      if (max_scale_power <= 0.0f) max_scale_power = 1500.0f;
+      int total_segments = 0;
+      if (wattsFwd > 1.0f) {
+          total_segments = (int)((wattsFwd / max_scale_power) * 16.0f);
+          if (total_segments > 16) total_segments = 16;
+      }
+      for (int i = 0; i < 16; i++) {
+          if (i < total_segments) lcd.write(0);
+          else lcd.print(' ');
+      }
     }
-
-        // ---- СТРОКА 2: ПОЛНОРАЗМЕРНАЯ АНАЛОГОВАЯ БАР-ЛИНЕЙКА (ПРОВЕРОЧНЫЙ ВАРИАНТ) ----
-    lcd.setCursor(0, 1); // Строго переходим на вторую строчку дисплея
-    
-    // Подстраховка: если лимит мощности во Flash равен 0 или сброшен, берем базовые 1500 Вт
-    float max_scale_power = lim_pout;
-    if (max_scale_power <= 0.0f) {
-        max_scale_power = 1500.0f; 
-    }
-
-    // Прецизионный расчет заполнения шкалы (от 0 до 16 сегментов)
-    int total_segments = 0;
-    if (wattsFwd > 1.0f) {
-        total_segments = (int)((wattsFwd / max_scale_power) * 16.0f);
-        if (total_segments > 16) total_segments = 16; // Ограничитель края экрана
-    }
-
-    // Физически выстреливаем проверочные символы на всю ширину строки
-    for (int i = 0; i < 16; i++) {
-        if (i < total_segments) {
-            lcd.write(0);  // СТРОГО ОБНОВЛЕНО: Выводим красивый, плотный кастомный кубик бар-линейки
-        } else {
-            lcd.print(" ");  // Стираем пустотой старые знаки при падении мощности
-        }
-    }
-
-
-
-
-
-
-
-
 }
