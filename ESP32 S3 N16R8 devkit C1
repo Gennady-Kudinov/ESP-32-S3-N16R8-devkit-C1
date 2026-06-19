@@ -45,8 +45,8 @@ extern const char HTML_BODY_NEW[] PROGMEM;
 
 // Настройки Wi-Fi сети
 // Динамические переменные Wi-Fi сети для чтения и записи во Flash
-String wifi_ssid_live = "name id";
-String wifi_pass_live = "pass";
+String wifi_ssid_live = "Dachnaja 8";
+String wifi_pass_live = "8101966G";
 
 // Настройка статического IP-адреса усилителя
 IPAddress local_IP(192, 168, 0, 123);
@@ -655,8 +655,9 @@ function saveProtSettings() {
   fetch('/save_prot?' + p.toString()).then(r => r.text()).then(msg => { alert(msg); });
 }
 
+// СТРОГО ОБНОВЛЕНО ПО ТЗ: Мгновенный сброс аварии в один клик без всплывающих окон подтверждения
 function resetTrip() {
-  fetch('/reset_trip').then(r => r.text()).then(msg => { alert(msg); });
+  fetch('/reset_trip');
 }
 
     function saveInterfaceProto() {
@@ -1129,7 +1130,7 @@ const char HTML_BODY_PART4[] PROGMEM = R"rawliteral(
     </div> 
     <div class='control-box'><div class='icom-btn'>AMP<div id='led-amp' class='btn-led'></div></div><div class='icom-btn'>TUNER<div id='led-tuner' class='btn-led led-active-orange'></div></div><div class='icom-btn'>ANTENNA<div class='btn-led led-active-green'></div></div><div class='icom-btn' onclick="showScreen('menu')" style='border-color:#ff9900; color:#ff9900;'>MENU<div class='btn-led led-active-orange'></div></div><div></div><div class='icom-btn' onclick='toggleBypass()' style='cursor:pointer;'>BYPASS<div id='led-bypass' class='btn-led led-active-orange'></div></div></div>  
   </div>
- 
+  
   <!-- ================= ЭКРАН 2: СЕТКА МЕНЮ НАСТРОЕК (MENU SCREEN) ================= -->
   <div class='menu-grid' id='menu-scr'>
     <div class='icom-btn' onclick="showScreen('page-seq')">PTT Sequencer</div>
@@ -1308,11 +1309,25 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
     <!-- ЦЕНТРАЛЬНЫЙ БЛОК ПРИБОРОВ: расширенные бар-линейки Id, Temp, P IN, Vd, FAN ШИМ -->
     <div class='telemetry-box'>
       <div class='tel-row'>
+        <span class='tel-lbl'>P IN:</span>
+        <div class='mini-bar-container' id='mb-pin'>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+        </div>
+        <span class='tel-val' id='val-pin'>0.0 W</span>
+      </div>
+      <div class='tel-row'>
         <span class='tel-lbl'>Id:</span>
         <div class='mini-bar-container' id='mb-id'>
           <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
         </div>
         <span class='tel-val' id='val-id'>0.00 A</span>
+      </div>
+      <div class='tel-row' onclick="showScreen('page-fan')" style='cursor:pointer; border-top:1px solid #14161d;'>
+        <span class='tel-lbl'>FAN ШИМ:</span>
+        <div class='mini-bar-container' id='mb-fan-pwm'>
+          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
+        </div>
+        <span class='tel-val' id='val-fan-pwm'>0%</span>
       </div>
       <div class='tel-row'>
         <span class='tel-lbl'>TEMP:</span>
@@ -1321,26 +1336,12 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
         </div>
         <span class='tel-val' id='val-temp'>25°C</span>
       </div>
-      <div class='tel-row'>
-        <span class='tel-lbl'>P IN:</span>
-        <div class='mini-bar-container' id='mb-pin'>
-          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
-        </div>
-        <span class='tel-val' id='val-pin'>0.0 W</span>
-      </div>
       <div class='tel-row' style='color:#00ff66;'>
         <span class='tel-lbl' style='color:#00ff66;'>Vd:</span>
         <div class='mini-bar-container' id='mb-vd'>
           <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
         </div>
         <span class='tel-val' id='val-vd' style='color:#00ff66;'>0.00 V</span>
-      </div>
-      <div class='tel-row' onclick="showScreen('page-fan')" style='cursor:pointer; border-top:1px solid #14161d;'>
-        <span class='tel-lbl'>FAN ШИМ:</span>
-        <div class='mini-bar-container' id='mb-fan-pwm'>
-          <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
-        </div>
-        <span class='tel-val' id='val-fan-pwm'>0%</span>
       </div>
     </div>
     
@@ -1370,10 +1371,10 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
     <div class='icom-btn' onclick="showScreen('page-tun')">Tuner</div>
     <div class='icom-btn' onclick="showScreen('page-int')">Интерфейсы</div>
     <div class='icom-btn' onclick="showScreen('page-net')">Настройка сети</div>
-    <div class='icom-btn' onclick="showScreen('page-time')" style='border-color:#00ff66; color:#00ff66;'>Установка времени</div>
-    <div class='icom-btn' onclick="showScreen('page-prot')" style='border-color:#00ff66; color:#00ff66;'>Protection</div>
-    <div class='icom-btn' onclick="showScreen('page-cal')" style='border-color:#ff9900; color:#ff9900;'>Калибровка AD8307</div>
-    <div class='icom-btn' onclick="showScreen('page-ota')" style='border-color:#00ff66; color:#00ff66;'>Обновление ПО</div>
+    <div class='icom-btn' onclick="showScreen('page-time')">Установка времени</div>
+    <div class='icom-btn' onclick="showScreen('page-prot')">Protection</div>
+    <div class='icom-btn' onclick="showScreen('page-cal')">Калибровка AD8307</div>
+    <div class='icom-btn' onclick="showScreen('page-ota')">Обновление ПО</div>
     <div></div>
     <div class='icom-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333;'>◀ BACK</div>
   </div>
