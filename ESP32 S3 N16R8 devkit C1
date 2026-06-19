@@ -969,6 +969,28 @@ if(document.getElementById('sel-proto') && !window.selProtoInitialized) {
   window.selProtoInitialized = true; 
 }
 
+    // СТРОГО ДОБАВЛЕНО ПО ТЗ: Автоматическое бегство неоновых диодов на экране вслед за частотомером
+    let server_ant = parseInt(parts[19]); // Извлекаем 20-й элемент (индекс 19 в массиве parts)
+    if (active_antenna_id !== server_ant && !isNaN(server_ant)) {
+      active_antenna_id = server_ant;
+      
+      // Переключаем 4 зеленых огонька внутри плитки ANTENNA на Главном экране
+      for (let i = 1; i <= 4; i++) {
+        let led = document.getElementById('ant-led' + i);
+        if (led) {
+          if (i === active_antenna_id) led.classList.add('led-active-green'); // Включаем неон
+          else led.classList.remove('led-active-green'); // Гасим остальные
+        }
+        
+        // Синхронизируем оранжевые рамки кнопок в скрытом подменю page-ant
+        let btn = document.getElementById('btn-ant' + i);
+        if (btn) {
+          if (i === active_antenna_id) { btn.style.borderColor = "#ff9900"; btn.firstElementChild.style.color = "#ff9900"; }
+          else { btn.style.borderColor = "#2c2e3a"; btn.firstElementChild.style.color = "#ffffff"; }
+        }
+      }
+    }
+
     let dot = document.getElementById('blink-dot');
     if (dot) { dot.style.opacity = '1'; setTimeout(() => dot.style.opacity = '0', 120); }
   });
@@ -1855,7 +1877,8 @@ void handleData() {
                     String(ext_current_id, 2) + "," + String(ext_temperature, 1) + "," + 
                     String(is_tripped ? 1 : 0) + "," + trip_reason + "," + String(wattsPin, 1) + "," + 
                     String(ext_protocol_type) + "," + String(fan_pwm_percent) + "," + String(active_trx_id) + "," +
-                    String(tci_connected ? 1 : 0) + "," + tci_host + "," + String(tci_port);
+                    String(tci_connected ? 1 : 0) + "," + tci_host + "," + String(tci_port) + "," +
+                    String(active_antenna_id); // <-- ДОПИСАНО В САМЫЙ ХВОСТ ПОТОКА!
 
   server.send(200, "text/plain", response); 
 }
