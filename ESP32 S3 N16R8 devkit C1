@@ -72,7 +72,7 @@ DallasTemperature tempSensor(&oneWire);
 #define PIN_595_LATCH   9   // STCP пин
 
 #define FREQ_INPUT_PIN 17   
-const int PRESCALER = 32;    
+const int PRESCALER = 32;   // Ваш аппаратный делитель частоты
 const unsigned long GATE_TIME_MS = 10; 
 
 uint32_t final_frequency = 0;          
@@ -97,7 +97,6 @@ uint32_t current_32bit_lpf_mask = 0x00000000;
 #define BIT_ANTENNA_4         (1UL << 30) // Физическая ножка 6 (Q6) 4-го чипа 74HC595
 #define BIT_RF_INPUT_RELAY    (1UL << 31) // Физическая ножка 7 (Q7) 4-го чипа 74HC595 (Секвенсор)
 
-
 float ext_voltage_vd = 0.00f;          
 float ext_current_id = 0.0f;           
 float ext_temperature = 25.0f;         
@@ -112,6 +111,29 @@ float lim_pref = 100.0f;
 float lim_lpf = 15.0f;      
 int   lim_tx_time = 10;
 int ext_protocol_type = 0; // 0=PCNT, 1=TCI, 2=WOLF, 3=CI-V, 4=YAESU, 5=KENWOOD
+
+//===
+// --- СТРОГО ДОБАВЛЕНО ПО ТЗ: НОВАЯ ПРЕЦИЗИОННАЯ МАТЕМАТИКА И ФИЛЬТРАЦИЯ ЧАСТОТОМЕРА ---
+enum FreqFsmState { FREQ_IDLE, FREQ_MEASURING, FREQ_LATCHED };
+FreqFsmState freq_fsm = FREQ_IDLE;
+bool freq_lpf_latched = false;
+
+const unsigned long FREQ_GATE_MS = 50;   // Окно одного замера (50 мс)
+const int FREQ_SAMPLES = 3;              // Количество замеров для медианы
+
+unsigned long freq_gate_start_us = 0;    // Таймер окна в микросекундах (micros)
+int current_sample_idx = 0;              // Текущий индекс замера в массиве
+double samples_buffer[3] = {0.0, 0.0, 0.0}; // Буфер для 3-х измерений
+uint32_t last_stable_frequency = 0;      // Защитный буфер гистерезиса полосы
+
+//===
+
+// --- ДОБАВЛЕНО: КОЭФФИЦИЕНТЫ КОРРЕКЦИИ ДАТЧИКОВ В МЕНЮ POWER SETTINGS ---
+float corr_offset_pin  = 0.0f; // Коррекция нуля P IN (Ватты)
+float corr_offset_id   = 0.0f; // Коррекция нуля Тока Id (Амперы)
+float corr_offset_temp = 0.0f; // Коррекция температуры (Градусы)
+float corr_offset_vd   = 0.0f; // Коррекция Вольтметра Vd (Вольты)
+
 
 // --- TCI (Transceiver Control Interface) — клиент к серверу Tetis / ExpertSDR ---
 WebSocketsClient tciSocket;
@@ -184,10 +206,6 @@ bool IRAM_ATTR on_pcnt_overflow(pcnt_unit_handle_t unit, const pcnt_watch_event_
     if (edata->watch_point_value == 20000) { pcnt_overflow_count++; }
     return false;
 }
-
-//*************************************************************
-// ************************** ЧАСТЬ 2 *************************
-//*************************************************************
 
 // Объявление и инициализация переменной фиксации АЦП
 float currentVoltFwdCalibrationSnapshot = 0.0f;
@@ -346,7 +364,6 @@ void autoSelectBand(double freqHz) {
         autoSelectAntennaForBand(newBandIdx);
     }
 }
-
 
 void calculateRfParameters(float rawVoltFwd, float rawVoltRef) {
     if (rawVoltFwd > 0.26f) { 
@@ -704,6 +721,21 @@ function resetTrip() {
         fetch('/save_fan?' + p.toString()).then(r => r.text()).then(msg => { alert(msg); });
       }
 
+      // ДОБАВЛЕНО: Сбор и отправка параметров калибровки из меню Power Settings
+function savePowerSettings() {
+  let pin = document.getElementById('c-pin').value;
+  let id = document.getElementById('c-id').value;
+  let vd = document.getElementById('c-vd').value;
+  let temp = document.getElementById('c-temp').value;
+  
+  fetch('/save_power_set?pin=' + pin + '&id=' + id + '&vd=' + vd + '&temp=' + temp)
+    .then(r => r.text())
+    .then(msg => { 
+      alert("Power Settings: " + msg); 
+      showScreen('main'); 
+    });
+}
+
             function saveWifiSettings() {
         let p = new URLSearchParams();
         p.append('ssid', document.getElementById('net-ssid').value);
@@ -923,7 +955,7 @@ if (trxLabel) {
     "PROT: EXPERT TCI", 
     "PROT: WOLF CAT", 
     "PROT: ICOM CI-V", 
-    "PROT: YAESU CAT", 
+    "PROT: YAESU CAT / FT-450", 
     "PROT: KENWOOD CAT"
   ];
 
@@ -1328,22 +1360,25 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
 
     </div>
     
-    <!-- ЦЕНТРАЛЬНЫЙ БЛОК ПРИБОРОВ: расширенные бар-линейки Id, Temp, P IN, Vd, FAN ШИМ -->
+    <!-- ЦЕНТРАЛЬНЫЙ БЛОК ПРИБОРОВ: СВЯЗАН С НОВЫМ МЕНЮ POWER SETTINGS -->
     <div class='telemetry-box'>
-      <div class='tel-row'>
-        <span class='tel-lbl'>P IN:</span>
+      <!-- 1. Строка P IN -->
+      <div class='tel-row' onclick="showScreen('page-power-set')" style='cursor:pointer;'>
+        <span class='tel-lbl' style='color:#ff9900;'>P IN:</span>
         <div class='mini-bar-container' id='mb-pin'>
           <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
         </div>
-        <span class='tel-val' id='val-pin'>0.0 W</span>
+        <span class='tel-val' id='val-pin' style='color:#ff9900;'>0.0 W</span>
       </div>
-      <div class='tel-row'>
+      <!-- 2. Строка Id -->
+      <div class='tel-row' onclick="showScreen('page-power-set')" style='cursor:pointer;'>
         <span class='tel-lbl'>Id:</span>
         <div class='mini-bar-container' id='mb-id'>
           <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
         </div>
         <span class='tel-val' id='val-id'>0.00 A</span>
       </div>
+      <!-- 3. Строка FAN ШИМ (Осталась в своей папке климата) -->
       <div class='tel-row' onclick="showScreen('page-fan')" style='cursor:pointer; border-top:1px solid #14161d;'>
         <span class='tel-lbl'>FAN ШИМ:</span>
         <div class='mini-bar-container' id='mb-fan-pwm'>
@@ -1351,14 +1386,16 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
         </div>
         <span class='tel-val' id='val-fan-pwm'>0%</span>
       </div>
-      <div class='tel-row'>
+      <!-- 4. Строка TEMP -->
+      <div class='tel-row' onclick="showScreen('page-power-set')" style='cursor:pointer;'>
         <span class='tel-lbl'>TEMP:</span>
         <div class='mini-bar-container' id='mb-temp'>
           <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
         </div>
         <span class='tel-val' id='val-temp'>25°C</span>
       </div>
-      <div class='tel-row' style='color:#00ff66;'>
+      <!-- 5. Строка Vd -->
+      <div class='tel-row' onclick="showScreen('page-power-set')" style='cursor:pointer; color:#00ff66;'>
         <span class='tel-lbl' style='color:#00ff66;'>Vd:</span>
         <div class='mini-bar-container' id='mb-vd'>
           <div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div><div class='mini-segment'></div>
@@ -1366,7 +1403,7 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
         <span class='tel-val' id='val-vd' style='color:#00ff66;'>0.00 V</span>
       </div>
     </div>
-    
+  
 <!-- Кнопки управления: вертикально справа (AMP → Tuner → Antenna → Bypass → Menu) -->
 <div class='control-box'>
   <div class='icom-btn'>AMP<div id='led-amp' class='btn-led'></div></div>
@@ -1535,6 +1572,22 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
     <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:90%; max-width:400px;'>НАЗАД</button>
   </div>
 
+  <!-- СТРОГО ДОБАВЛЕНО ПО ТЗ: ОФИЦИАЛЬНОЕ МЕНЮ КОРРЕКЦИИ ДАТЧИКОВ POWER SETTINGS -->
+  <div id='page-power-set' class='menu-sub-page' style='text-align:center;'>
+    <div class='sub-title' style='color:#ff9900; letter-spacing:1px; margin-bottom:5px;'>POWER SETTINGS</div>
+    <div style='font-size:0.65rem; color:#5c5e66; margin-bottom:20px; letter-spacing:1px;'>КОРРЕКЦИЯ И КАЛИБРОВКА СИСТЕМНЫХ ДАТЧИКОВ ТЕЛЕМЕТРИИ</div>
+    
+    <div class='hitech-container' style='padding:15px; background:#0d0f14; border-radius:6px; margin-bottom:20px; border:1px solid #1a1c23;'>
+      <!-- Сюда бэкенд на лету подставит 4 созданных ползунка коррекции -->
+      %SLIDERS_POWER_SETTING%
+    </div>
+    
+    <div style='display:flex; justify-content:space-between; width:90%; max-width:400px; margin:0 auto; gap:10px;'>
+      <button class='prot-action-btn' onclick='savePowerSettings()' style='border-color:#00ff66; color:#00ff66; width:50%; font-weight:bold;'>СОХРАНИТЬ</button>
+      <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:50%; font-weight:bold;'>CANCEL</button>
+    </div>
+  </div>
+
   <div id='page-tun' class='menu-sub-page'><div class='sub-title'>Настройки тюнера</div><p>Параметры согласования</p><button class='prot-action-btn' onclick="showScreen('main')">Назад</button></div>
   
   <!-- ДОБАВЛЕНО: Меню интерфейсов строго по вашему фото образца -->
@@ -1561,6 +1614,7 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
         <option value='5'>5 - KENWOOD CAT PROTOCOL (TS-SERIES)</option>
       </select>
     </div>
+
 
     <div style='text-align:left; width:85%; max-width:400px; margin:0 auto 20px auto;'>
       <div style='font-size:0.75rem; color:#4a86e8; font-weight:bold; margin-bottom:5px; letter-spacing:1px;'>TCI SERVER (Tetis / ExpertSDR)</div>
@@ -1661,6 +1715,16 @@ String makeSliderCard(String name, String range, String id, float currentVal, fl
   s += makeSliderCard("Ток ФНЧ (LPF)", "0A - 30A", "sl-lpf", lim_lpf, 0, 30, 1.0f);
   s += makeSliderCard("Таймаут TX", "0s - 60s", "sl-txtime", lim_tx_time, 0, 60, 1.0f);
   s += makeSliderCard("Температура", "30C - 75C", "sl-temp", lim_temp, 30, 75, 1.0f);
+  //=======
+  // СТРОГО ДОБАВЛЕНО ПО ТЗ: Формирование 4-х ползунков коррекции для нового меню Power Settings
+  String powerSliders = "";
+  powerSliders += makeSliderCard("Сдвиг нуля P IN", "-10W ... +10W", "c-pin", corr_offset_pin, -10, 10, 0.1f);
+  powerSliders += makeSliderCard("Сдвиг нуля Тока Id", "-5A ... +5A", "c-id", corr_offset_id, -5, 5, 0.05f);
+  powerSliders += makeSliderCard("Калибровка вольт Vd", "-10V ... +10V", "c-vd", corr_offset_vd, -10, 10, 0.1f);
+  powerSliders += makeSliderCard("Сдвиг Термометра", "-10C ... +10C", "c-temp", corr_offset_temp, -10, 10, 0.5f);
+  s.replace("%SLIDERS_POWER_SETTING%", powerSliders);
+
+  //=======
 
   s += "  </div><br><div style='display:flex; justify-content:space-between; width:85%; max-width:400px; margin:0 auto; gap:10px;'>";
   s += "    <button class='prot-action-btn' onclick='saveProtSettings()' style='border-color:#00ff66; color:#00ff66;'>Сохранить</button>";
@@ -1772,6 +1836,35 @@ void handleSaveFanSettings() {
   prefs.end();
   server.send(200, "text/plain", "Уставки ШИМ вентилятора успешно сохранены!");
 }
+
+//============
+// СТРОГО ДОБАВЛЕНО ПО ТЗ: Сетевой шлюз приема и намертво зашивки параметров калибровки в Preferences
+void handleSavePowerSettings() {
+  if (!server.hasArg("pin") || !server.hasArg("id") || !server.hasArg("vd") || !server.hasArg("temp")) {
+    server.send(400, "text/plain", "Ошибка: Неполные данные калибровки Power Settings!");
+    return;
+  }
+  
+  // Принимаем новые дробные уставки сдвигов от ползунков смартфона/ПК
+  corr_offset_pin  = server.arg("pin").toFloat();
+  corr_offset_id   = server.arg("id").toFloat();
+  corr_offset_vd   = server.arg("vd").toFloat();
+  corr_offset_temp = server.arg("temp").toFloat();
+
+  // Намертво зашиваем уставки в ваше родное кириллическое пространство "усилитель"
+  prefs.begin("усилитель", false);
+  prefs.putFloat("c_pin", corr_offset_pin);
+  prefs.putFloat("c_id", corr_offset_id);
+  prefs.putFloat("c_vd", corr_offset_vd);
+  prefs.putFloat("c_temp", corr_offset_temp);
+  prefs.end();
+  
+  Serial0.printf("Power Settings: Калибровка обновлена. P IN offset: %.1f W, Id offset: %.2f A, Vd offset: %.1f V, Temp offset: %.1f C\n", 
+                 corr_offset_pin, corr_offset_id, corr_offset_vd, corr_offset_temp);
+  
+  server.send(200, "text/plain", "Коэффициенты калибровки успешно зафиксированы во Flash!");
+}
+//============
 
 void handleSaveSequencerSettings() {
   if (!server.hasArg("o_tx") || !server.hasArg("o_rx") || !server.hasArg("b_tx") ||
@@ -1954,9 +2047,6 @@ void setup() {
   tempSensor.begin();
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
 
-
-
- 
   // СТРОГО ОБНОВЛЕНО: Запуск экрана 1602 на общей параллельной системной шине Wire
   lcd.init(); 
   lcd.backlight(); // Включаем подсветку экрана
@@ -1968,9 +2058,6 @@ void setup() {
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print("POWER:   0 W"); // Стартовая заставка при включении УМ
-
-
-
 
     // --- КОНФИГУРАЦИЯ MCP23017 СТРОГО ПО ДАТАШИТУ SOIC-28 (КАНАЛ 1 МУЛЬТИПЛЕКСОРА) ---
   selectI2CChannel(1); // Открываем изолированный Канал 1
@@ -2010,7 +2097,6 @@ void setup() {
   Wire.write(0x80); // Выставляем 1 на Бит 7 (ножка 8), остальные в ноль
   Wire.endTransmission();
 
-
   Wire.beginTransmission(MCP_ADDR);
   Wire.write(GPPUB);
   Wire.write(0x01); // Включаем Pull-Up резистор на Бит 0 (ножка 1, GPB0, Вход PTT)
@@ -2023,15 +2109,12 @@ void setup() {
 
   selectI2CChannel(0); // Намертво возвращаем мультиплексор на скоростной Канал 0 (ADS1115)
 
-
   analogReadResolution(12);
   pinMode(PIN_595_DATA, OUTPUT); pinMode(PIN_595_CLOCK, OUTPUT); pinMode(PIN_595_LATCH, OUTPUT);
   digitalWrite(PIN_595_LATCH, LOW);
   shiftOut(PIN_595_DATA, PIN_595_CLOCK, MSBFIRST, 0x00);
   digitalWrite(PIN_595_LATCH, HIGH);
   pinMode(FREQ_INPUT_PIN, INPUT);
-
-// **************************** ЧАСТЬ 6.3 ******************************
 
   prefs.begin("calib", true); 
   if (prefs.isKey("slope")) {
@@ -2104,7 +2187,39 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRoot); server.on("/data", HTTP_GET, handleData);
   server.on("/set_cal", HTTP_GET, handleSetCal); server.on("/set_time", HTTP_GET, handleSetTime); 
-  server.on("/sync_ntp", HTTP_GET, handleSyncNtp); server.on("/save_prot", HTTP_GET, handleSaveProt);  
+  server.on("/sync_ntp", HTTP_GET, handleSyncNtp); server.on("/save_prot", HTTP_GET, handleSaveProt);
+
+  // СТРОГО ДОБАВЛЕНО: Регистрация сетевого шлюза для папки Power Settings
+  server.on("/save_power_set", HTTP_GET, handleSavePowerSettings);
+
+  // ДОБАВЛЕНО: Автовыгрузка коэффициентов калибровки Power Settings из Flash при старте УМ
+  prefs.begin("усилитель", true); // Режим только чтение
+  corr_offset_pin  = prefs.getFloat("c_pin", 0.0f);
+  corr_offset_id   = prefs.getFloat("c_id", 0.0f);
+  corr_offset_vd   = prefs.getFloat("c_vd", 0.0f);
+  corr_offset_temp = prefs.getFloat("c_temp", 0.0f);
+  prefs.end();
+
+  //==================
+  // ДОБАВЛЕНО: Локальный запуск порта Serial2 для FT-450 (WOLF) по USB
+  prefs.begin("усилитель", true);
+  int current_proto = prefs.getInt("ext_prot", 0);
+  int saved_baud_idx = prefs.getInt("ext_baud", 1);
+  prefs.end();
+
+  if (current_proto == 4) { // Если в меню выбран профиль FT-450 / WOLF USB
+      long target_baud = 9600;
+      if (saved_baud_idx == 0) target_baud = 4800;
+      if (saved_baud_idx == 1) target_baud = 9600;
+      if (saved_baud_idx == 2) target_baud = 19200;
+      if (saved_baud_idx == 3) target_baud = 38400;
+      if (saved_baud_idx == 4) target_baud = 115200;
+      
+      // Инициализируем Serial2. Пины: RX на GPIO 16, TX на GPIO 15
+      Serial2.begin(target_baud, SERIAL_8N1, 16, 15);
+      Serial0.println("CAT Link: Порт Serial2 успешно запущен для FT-450 / WOLF USB.");
+  }
+  //==================
   server.on("/reset_trip", HTTP_GET, handleResetTrip);
   server.on("/save_ext_proto", HTTP_GET, handleSaveExtProto);
   server.on("/save_tci", HTTP_GET, handleSaveTciSettings);
@@ -2180,6 +2295,33 @@ void setup() {
 }
 
 void loop() {
+  //==============================
+    // СТРОГО ОБНОВЛЕНО ПО ТЗ: АВТОНОМНЫЙ ASCII ПАРСЕР ЧАСТОТЫ FT-450 (WOLF USB) БЕЗ ВНЕШНИХ ПЕРЕМЕННЫХ
+  if (ext_protocol_type == 4) {
+      static String ft450_local_buffer = ""; // Локальный защищенный буфер строки Yaesu
+      
+      while (Serial2.available()) {
+          char c = Serial2.read();
+          if (c == ';') { // Конец команды долетел
+              if (ft450_local_buffer.startsWith("FA") && ft450_local_buffer.length() >= 7) {
+                  String freqStr = ft450_local_buffer.substring(2);
+                  double parsedFreqHz = freqStr.toDouble();
+                  
+                  if (parsedFreqHz > 1000000.0 && parsedFreqHz < 60000000.0) {
+                      final_frequency = (unsigned long)parsedFreqHz;
+                      
+                      // Мгновенный вызов вашей оригинальной автопривязки ФНЧ и Антенн!
+                      autoSelectBand(parsedFreqHz);
+                  }
+              }
+              ft450_local_buffer = ""; // Очистка буфера для следующего шага
+          } else if (c >= 32) {
+              ft450_local_buffer += c;
+              if (ft450_local_buffer.length() > 24) ft450_local_buffer = ""; // Защита от переполнения
+          }
+      }
+  }
+  //==============================
   server.handleClient();
   tciService();
   
@@ -2409,29 +2551,105 @@ void loop() {
           }
       }
   }
-
-  // Передаем признак нажатия PTT в КВ-частотомер (PCNT) — только если активен протокол PCNT
+  
+//===
+   // --- ОБНОВЛЕНО: ПРЕЦИЗИОННЫЙ FSM-АВТОМАТ ЧАСТОТОМЕРА (МЕДИАНА 3х50мс, MICROS, ГИСТЕРЕЗИС 3%) ---
   if (ext_protocol_type == 0) {
-    bool is_ptt_pressed = (active_trx_id == 2) ? ptt2_active : ptt1_active;
-    if (is_ptt_pressed) {
-        if (millis() - last_measurement >= GATE_TIME_MS) {
-            int pulse_count = 0; pcnt_unit_get_count(pcnt_unit, &pulse_count);
-            int64_t total_pulses = (pcnt_overflow_count * 20000) + pulse_count;
-            pcnt_overflow_count = 0; pcnt_unit_clear_count(pcnt_unit);
-            unsigned long current_gate = millis() - last_measurement; last_measurement = millis();
-            if (total_pulses < 0) total_pulses = 0;
+      bool current_ptt = (active_trx_id == 2) ? ptt2_active : ptt1_active;
+      
+      // Условие старта измерения: PTT нажата, обход ВЫКЛ, раскачка ЕСТЬ (>=1.0W), аварии НЕТ
+      bool mayMeasure = current_ptt && bypass_state == 0 && wattsPin >= 1.0f && !is_tripped;
 
-            if (wattsFwd > 0.5f) {
-                last_calculated_frequency = ((double)total_pulses * 1000.0 / (double)current_gate) * PRESCALER * calibration_factor;
-                final_frequency = (uint32_t)last_calculated_frequency; autoSelectBand(last_calculated_frequency);
-            } else { final_frequency = 0; last_calculated_frequency = 0.0; }
-            double mhz = (double)final_frequency / 1000000.0;
-            Serial0.print("Частота: "); Serial0.print(mhz, 6); Serial0.print(" MHz | Диапазон: "); Serial0.println(current_band_name);
-        }
-    } else {
-        last_measurement = millis(); 
-    }
+      // Если педаль отпущен — мгновенно сбрасываем автомат в исходный режим ожидания RX
+      if (!current_ptt) {
+          freq_fsm = FREQ_IDLE;
+          freq_lpf_latched = false;
+          current_sample_idx = 0;
+          pcnt_unit_clear_count(pcnt_unit);
+          pcnt_overflow_count = 0;
+      }
+
+      // Входим в режим измерения: обнуляем счётчики строго ОДИН РАЗ в начале нового окна
+      if (mayMeasure && freq_fsm == FREQ_IDLE) {
+          freq_fsm = FREQ_MEASURING;
+          current_sample_idx = 0;
+          pcnt_overflow_count = 0;
+          pcnt_unit_clear_count(pcnt_unit);
+          freq_gate_start_us = micros(); // Засекаем микросекунды старта
+      }
+
+      // Контур циклического набора 3-х образцов частоты
+      if (freq_fsm == FREQ_MEASURING) {
+          unsigned long elapsed_us = micros() - freq_gate_start_us;
+          
+          // Каждые 50 миллисекунд (50000 микросекунд) снимаем показания счетчика
+          if (elapsed_us >= (FREQ_GATE_MS * 1000)) {
+              int pulse_count = 0;
+              pcnt_unit_get_count(pcnt_unit, &pulse_count);
+              
+              // Вычисляем сумму импульсов (не обнуляя pcnt_overflow_count во время замера)
+              int64_t total_pulses = (pcnt_overflow_count * 20000) + pulse_count;
+              if (total_pulses < 0) total_pulses = 0;
+
+              // Прецизионный расчет частоты в Герцах по вашей формуле через micros()
+              double current_hz = ((double)total_pulses * 1000000.0 / (double)elapsed_us) * (double)PRESCALER * calibration_factor;
+              
+              // Если считаются оба фронта (rising + falling), делим частоту на 2
+              // current_hz = current_hz / 2.0; 
+
+              // Записываем замер в буфер медианы
+              samples_buffer[current_sample_idx] = current_hz;
+              current_sample_idx++;
+
+              // Перезапускаем микросекундный таймер для следующего сэмпла
+              pcnt_overflow_count = 0;
+              pcnt_unit_clear_count(pcnt_unit);
+              freq_gate_start_us = micros();
+
+              // Как только набрали ровно 3 чистых измерения — вычисляем медиану
+              if (current_sample_idx >= FREQ_SAMPLES) {
+                  // Простейшая сортировка 3-х элементов для поиска среднего (медианы)
+                  double median_hz = 0.0;
+                  double a = samples_buffer[0]; double b = samples_buffer[1]; double c = samples_buffer[2];
+                  if ((a >= b && a <= c) || (a >= c && a <= b)) median_hz = a;
+                  else if ((b >= a && b <= c) || (b >= c && b <= a)) median_hz = b;
+                  else median_hz = c;
+
+                  uint32_t final_hz = (uint32_t)median_hz;
+
+                  // --- АЛГОРИТМ 3% ГИСТЕРЕЗИСА ДИАПАЗОНА ---
+                  bool change_required = false;
+                  if (last_stable_frequency == 0) {
+                      change_required = true; // Самый первый замер при включении TX
+                  } else {
+                      // Вычисляем дельту изменения частоты относительно прошлого стабильного замера
+                      double delta_percent = abs((double)final_hz - (double)last_stable_frequency) / (double)last_stable_frequency;
+                      if (delta_percent > 0.03) { // Если частота прыгнула более чем на 3%
+                          change_required = true;
+                      }
+                  }
+
+                  // Если гистерезис пройден — обновляем глобальную частоту и переключаем реле
+                  if (change_required && final_hz > 1000000) {
+                      last_stable_frequency = final_hz;
+                      final_frequency = final_hz;
+                      
+                      // Вызываем вашу оригинальную автопривязку ФНЧ и Антенн (внутри неё стоит защита writeRegister595)
+                      autoSelectBand(median_hz); 
+                  }
+
+                  // Намертво блокируем частотомер до тех пор, пока PTT не отпустится!
+                  freq_fsm = FREQ_LATCHED;
+                  freq_lpf_latched = true;
+
+                  // Выстреливаем лабораторный отчет в монитор порта
+                  Serial0.printf("FSM Частотомер: Медианный замер готов! Частота: %.6f MHz. Гистерезис пройден: %s. ФНЧ: %s. Контур заблокирован.\n", 
+                                 (double)last_stable_frequency / 1000000.0, change_required ? "ДА" : "НЕТ", current_band_name.c_str());
+              }
+          }
+      }
   }
+//===
 
   // --- АВТОМАТИЧЕСКИЙ РАСЧЕТ И УПРАВЛЕНИЕ ШИМ ВЕНТИЛЯТОРА (DEVKIT ПИН 14) ---
   static unsigned long lastFanControlTimer = 0;
