@@ -4,7 +4,7 @@
 #include <WebSocketsClient.h> // TCI-клиент для связи с Tetis / ExpertSDR (Links2004 WebSockets)
 #include <Wire.h>             // Аппаратная шина I2C для мультиплексора и внешнего АЦП
 
-// --- СТРОГО ОБНОВЛЕНО: ДИСПЛЕЙ 1602 ПОДКЛЮЧЕН ПАРАЛЛЕЛЬНО НА ОСНОВНУЮ ШИНУ I2C ---
+// --- ОБНОВЛЕНО: ДИСПЛЕЙ 1602 ПОДКЛЮЧЕН ПАРАЛЛЕЛЬНО НА ОСНОВНУЮ ШИНУ I2C ---
 #include <LiquidCrystal_I2C.h>
 // Объявляем объект дисплея. 0x27 - адрес, 16 символов, 2 логические строки
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
@@ -112,7 +112,7 @@ float lim_lpf = 15.0f;
 int   lim_tx_time = 10;
 int ext_protocol_type = 0; // 0=PCNT, 1=TCI, 2=WOLF, 3=CI-V, 4=YAESU, 5=KENWOOD
 
-// --- СТРОГО ДОБАВЛЕНО ПО ТЗ: НОВАЯ ПРЕЦИЗИОННАЯ МАТЕМАТИКА И ФИЛЬТРАЦИЯ ЧАСТОТОМЕРА ---
+// --- ДОБАВЛЕНО: НОВАЯ ПРЕЦИЗИОННАЯ МАТЕМАТИКА И ФИЛЬТРАЦИЯ ЧАСТОТОМЕРА ---
 enum FreqFsmState { FREQ_IDLE, FREQ_MEASURING, FREQ_LATCHED };
 FreqFsmState freq_fsm = FREQ_IDLE;
 bool freq_lpf_latched = false;
@@ -156,7 +156,7 @@ enum BandIndex : uint8_t {
 };
 int band_antenna_map[BAND_COUNT] = {1, 1, 1, 2, 2, 3, 4};
 int current_band_index = -1;
-// СТРОГО ДОБАВЛЕНО: Глобальные флаги состояния педалей PTT для сквозной видимости в loop()
+// ДОБАВЛЕНО: Глобальные флаги состояния педалей PTT для сквозной видимости в loop()
 bool ptt1_active = false;
 bool ptt2_active = false;
 // Уставки климата для плавного ШИМ вентилятора (DevKit пин 14)
@@ -383,7 +383,7 @@ void calculateRfParameters(float rawVoltFwd, float rawVoltRef) {
     } else { swr = 1.00f; }
 }
 
-// ВОССТАНОВЛЕНО СТРОГО ПО ТЗ: Двухточечный расчет калибровки AD8307
+// ВОССТАНОВЛЕНО: Двухточечный расчет калибровки AD8307
   void processTwoPointCalibration() {
     // СТРОГО ИСПРАВЛЕНО ПО ТЗ: Опорные реперы переведены на 5 Вт (37 dBm) и 500 Вт (57 dBm)
     float dbmPt1 = 37.0f - COUPLER_ATTN; 
@@ -858,7 +858,7 @@ function triggerFileSelect() {
   if (fileInput) { fileInput.click(); }
 }
 
-// СТРОГО ИСПРАВЛЕНО: Интерактивный метод считывания первого файла, вывод имени и прецизионный POST-стриминг
+// ИСПРАВЛЕНО: Интерактивный метод считывания первого файла, вывод имени и прецизионный POST-стриминг
 function uploadRouter() {
   var fileInput = document.getElementById('file');
   if (!fileInput || fileInput.files.length === 0) { alert('Сначала выберите файл .bin!'); return; }
@@ -1001,7 +1001,7 @@ if(document.getElementById('sel-proto') && !window.selProtoInitialized) {
   window.selProtoInitialized = true; 
 }
 
-    // СТРОГО ДОБАВЛЕНО ПО ТЗ: Автоматическое бегство неоновых диодов на экране вслед за частотомером
+    // ДОБАВЛЕНО: Автоматическое бегство неоновых диодов на экране вслед за частотомером
     let server_ant = parseInt(parts[19]); // Извлекаем 20-й элемент (индекс 19 в массиве parts)
     if (active_antenna_id !== server_ant && !isNaN(server_ant)) {
       active_antenna_id = server_ant;
@@ -1261,7 +1261,7 @@ const char HTML_BODY_PART4[] PROGMEM = R"rawliteral(
     <button class='prot-action-btn' onclick="showScreen('main')">Назад</button>
   </div>
 
-    <!-- СТРОГО ИСПРАВЛЕНО: Современный лаконичный интерфейс синхронизации системного времени -->
+    <!-- ИСПРАВЛЕНО: Современный лаконичный интерфейс синхронизации системного времени -->
   <div id='page-time' class='menu-sub-page' style='text-align:center;'>
     <div class='sub-title' style='color:#ffffff; letter-spacing:1px; margin-bottom:5px;'>SYSTEM CLOCK CONFIGURATION</div>
     <div style='font-size:0.65rem; color:#5c5e66; letter-spacing:1px; margin-bottom:25px;'>INTERNAL POSIX REAL-TIME CLOCK SYNC</div>
@@ -1340,7 +1340,7 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
 
             <!-- ДОБАВЛЕНО: Окно EXT COM STATUS строго ниже Wi-Fi -->
 
-           <!-- СТРОГО ИСПРАВЛЕНО: Горизонтальный ряд окон EXT COM STATUS и ANT MTR бок о бок -->
+           <!-- ИСПРАВЛЕНО: Горизонтальный ряд окон EXT COM STATUS и ANT MTR бок о бок -->
       <div style='display:flex; justify-content:space-between; align-items:center; width:100%; margin-top:0px;'>
         <div class='wifi-box' onclick="showScreen('page-int')" style='cursor:pointer; border-color:#4a86e8; height:85px; width:calc(100% - 85px); margin-top:0px;'>
           <div class='wifi-title' style='color:#4a86e8;'>EXT COM STATUS</div>
@@ -1348,7 +1348,7 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
           <div class='wifi-detail' id='ext-link' style='color:#ff3333;'>LINK: DISCONNECTED</div>
           <div class='wifi-detail' id='ext-detail' style='color:#8e8e9f;'>NATIVE USB: NOT FOUND</div>
         </div>
-                <!-- СТРОГО ИСПРАВЛЕНО ПО ТЗ: Окно ANT MTR переведено в режим интерактивной кнопки прямого вызова папки Антенн -->
+                <!-- ИСПРАВЛЕНО ПО ТЗ: Окно ANT MTR переведено в режим интерактивной кнопки прямого вызова папки Антенн -->
         <div class='ant-status-box' onclick="showScreen('page-ant')" style='cursor:pointer; margin-top:0px;'>
           <div class='ant-status-title'>ANT MTR</div>
           <div class='ant-status-val'><span class='ant-status-lbl'>R:</span><span id='ant-r'>0.0</span></div>
@@ -1572,7 +1572,7 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
     <button class='prot-action-btn' onclick="showScreen('main')" style='border-color:#ff3333; color:#ff3333; width:90%; max-width:400px;'>НАЗАД</button>
   </div>
 
-  <!-- СТРОГО ДОБАВЛЕНО ПО ТЗ: ОФИЦИАЛЬНОЕ МЕНЮ КОРРЕКЦИИ ДАТЧИКОВ POWER SETTINGS -->
+  <!-- ДОБАВЛЕНО: ОФИЦИАЛЬНОЕ МЕНЮ КОРРЕКЦИИ ДАТЧИКОВ POWER SETTINGS -->
   <div id='page-power-set' class='menu-sub-page' style='text-align:center;'>
     <div class='sub-title' style='color:#ff9900; letter-spacing:1px; margin-bottom:5px;'>POWER SETTINGS</div>
     <div style='font-size:0.65rem; color:#5c5e66; margin-bottom:20px; letter-spacing:1px;'>КОРРЕКЦИЯ И КАЛИБРОВКА СИСТЕМНЫХ ДАТЧИКОВ ТЕЛЕМЕТРИИ</div>
@@ -1662,7 +1662,7 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
     <button class='prot-action-btn' onclick="showScreen('main')">Назад</button>
   </div>
   
-   <!-- СТРОГО ИСПРАВЛЕНО: Полная очистка дублей, лаконичное хай-тек меню времени УМ -->
+   <!-- ИСПРАВЛЕНО: Полная очистка дублей, лаконичное хай-тек меню времени УМ -->
   <div id='page-time' class='menu-sub-page' style='text-align:center;'>
     <div class='sub-title' style='color:#ff9900; letter-spacing:1px; margin-bottom:5px;'>УСТАНОВКА ВРЕМЕНИ И КАЛЕНДАРЯ</div>
     <div style='font-size:0.65rem; color:#5c5e66; letter-spacing:1px; margin-bottom:25px;'>ВНУТРЕННИЕ ЧАСЫ РЕАЛЬНОГО ВРЕМЕНИ КИЛОВАТТНОГО УМ</div>
@@ -1716,7 +1716,7 @@ String makeSliderCard(String name, String range, String id, float currentVal, fl
   s += makeSliderCard("Таймаут TX", "0s - 60s", "sl-txtime", lim_tx_time, 0, 60, 1.0f);
   s += makeSliderCard("Температура", "30C - 75C", "sl-temp", lim_temp, 30, 75, 1.0f);
   //=======
-  // СТРОГО ДОБАВЛЕНО ПО ТЗ: Формирование 4-х ползунков коррекции для нового меню Power Settings
+  // ДОБАВЛЕНО: Формирование 4-х ползунков коррекции для нового меню Power Settings
   String powerSliders = "";
   powerSliders += makeSliderCard("Сдвиг нуля P IN", "-10W ... +10W", "c-pin", corr_offset_pin, -10, 10, 0.1f);
   powerSliders += makeSliderCard("Сдвиг нуля Тока Id", "-5A ... +5A", "c-id", corr_offset_id, -5, 5, 0.05f);
@@ -1838,7 +1838,7 @@ void handleSaveFanSettings() {
 }
 
 //============
-// СТРОГО ДОБАВЛЕНО ПО ТЗ: Сетевой шлюз приема и намертво зашивки параметров калибровки в Preferences
+// ДОБАВЛЕНО: Сетевой шлюз приема и намертво зашивки параметров калибровки в Preferences
 void handleSavePowerSettings() {
   if (!server.hasArg("pin") || !server.hasArg("id") || !server.hasArg("vd") || !server.hasArg("temp")) {
     server.send(400, "text/plain", "Ошибка: Неполные данные калибровки Power Settings!");
@@ -2134,7 +2134,7 @@ void setup() {
   fan_t_max  = prefs.getInt("f_tmax", 65);
   fan_pct_min = prefs.getInt("f_pmin", 20);
 
-    // СТРОГО ДОБАВЛЕНО: Автоматическая выгрузка 6 задержек секвенсора из Flash при включении УМ
+    // ДОБАВЛЕНО: Автоматическая выгрузка 6 задержек секвенсора из Flash при включении УМ
   seq_rf_out_tx = prefs.getInt("sq_o_tx", 10);  seq_rf_out_rx = prefs.getInt("sq_o_rx", 30);
   seq_bias_tx   = prefs.getInt("sq_b_tx", 25);  seq_bias_rx   = prefs.getInt("sq_b_rx", 5);
   seq_rf_in_tx  = prefs.getInt("sq_i_tx", 15);  seq_rf_in_rx  = prefs.getInt("sq_i_rx", 20);
@@ -2297,7 +2297,7 @@ void setup() {
 void loop() {
 
   // =================================================================================
-  // СТРОГО ДОБАВЛЕНО ПО ТЗ: ОПРОС ФИЗИЧЕСКОЙ КНОПКИ СБРОСА АВАРИИ (22-я НОЖКА / GPA1 MCP23017)
+  // ДОБАВЛЕНО: ОПРОС ФИЗИЧЕСКОЙ КНОПКИ СБРОСА АВАРИИ (22-я НОЖКА / GPA1 MCP23017)
   // Опрашивает расширитель портов раз в 30 мс и строго в момент аварии, защищая loop()
   // =================================================================================
   static unsigned long lastMcpButtonCheck = 0;
@@ -2339,7 +2339,7 @@ void loop() {
   }
   // =================================================================================
 
-    // СТРОГО ОБНОВЛЕНО ПО ТЗ: АВТОНОМНЫЙ ASCII ПАРСЕР ЧАСТОТЫ FT-450 (WOLF USB) БЕЗ ВНЕШНИХ ПЕРЕМЕННЫХ
+    // ОБНОВЛЕНО: АВТОНОМНЫЙ ASCII ПАРСЕР ЧАСТОТЫ FT-450 (WOLF USB) БЕЗ ВНЕШНИХ ПЕРЕМЕННЫХ
   if (ext_protocol_type == 4) {
       static String ft450_local_buffer = ""; // Локальный защищенный буфер строки Yaesu
       
@@ -2596,7 +2596,7 @@ void loop() {
   }
   
 //===
-  // --- СТРОГО ОБНОВЛЕНО ПО ТЗ: КОНЕЧНЫЙ АВТОМАТ ОДНОКРАТНОГО ЗАМЕРА ЧАСТОТЫ ФНЧ ПРИ СТАРТЕ TX ---
+  // --- ОБНОВЛЕНО: КОНЕЧНЫЙ АВТОМАТ ОДНОКРАТНОГО ЗАМЕРА ЧАСТОТЫ ФНЧ ПРИ СТАРТЕ TX ---
   if (ext_protocol_type == 0) {
       bool current_ptt = (active_trx_id == 2) ? ptt2_active : ptt1_active;
       
@@ -2711,7 +2711,7 @@ void loop() {
       ledcWrite(14, pwmDuty); // Физически выдаем ШИМ на вывод 14 платы DevKit
   }
 
-        // СТРОГО ОБНОВЛЕНО: двухстрочный вывод на LCD 1602 — обновление не чаще 100 мс (снижение нагрузки на loop)
+        // ОБНОВЛЕНО: двухстрочный вывод на LCD 1602 — обновление не чаще 100 мс (снижение нагрузки на loop)
     static unsigned long lastLcdUpdate = 0;
     static int lastLcdWatts = -1;
     int curWatts = (int)wattsFwd;
