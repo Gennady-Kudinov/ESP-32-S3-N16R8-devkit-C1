@@ -2295,7 +2295,50 @@ void setup() {
 }
 
 void loop() {
-  //==============================
+
+  // =================================================================================
+  // СТРОГО ДОБАВЛЕНО ПО ТЗ: ОПРОС ФИЗИЧЕСКОЙ КНОПКИ СБРОСА АВАРИИ (22-я НОЖКА / GPA1 MCP23017)
+  // Опрашивает расширитель портов раз в 30 мс и строго в момент аварии, защищая loop()
+  // =================================================================================
+  static unsigned long lastMcpButtonCheck = 0;
+  if (is_tripped && (millis() - lastMcpButtonCheck >= 30)) { 
+      lastMcpButtonCheck = millis();
+      
+      selectI2CChannel(1); // Открываем изолированный Канал 1 для общения с MCP23017
+      Wire.beginTransmission(MCP_ADDR);
+      Wire.write(GPIOA_REG); // Указываем регистр чтения Порта А (0x12)
+      Wire.endTransmission();
+      
+      Wire.requestFrom(MCP_ADDR, 1);
+      if (Wire.available()) {
+          uint8_t portA = Wire.read();
+          
+          // Проверяем состояние Бита 1 (GPA1 — ваша кнопка на 22-й ножке)
+          // Так как включена подтяжка, при физическом нажатии (замыкании на GND) бит станет равен 0
+          if ((portA & 0x02) == 0) { 
+              is_tripped = false;
+              trip_reason = "SYSTEM OK";
+              
+              // Мгновенно возвращаем пин защиты 18 в режим HIGH (разрешение работы УМ)
+              pinMode(18, OUTPUT);
+              digitalWrite(18, HIGH); 
+              
+              // На лету тушим аварийный зумер (Бит 7 / GPA7) и восстанавливаем реле Байпаса, если нужно
+              uint8_t outMask = 0x00;
+              if (bypass_state) outMask |= 0x01; // Если обход был включен, сохраняем его бит GPA0
+              
+              Wire.beginTransmission(MCP_ADDR);
+              Wire.write(GPIOA_REG);
+              Wire.write(outMask); // Записываем чистую маску, выключая пищалку зумера
+              Wire.endTransmission();
+              
+              Serial0.println("System: Авария успешно сброшена ФИЗИЧЕСКОЙ КНОПКОЙ на 22-й ножке MCP23017!");
+          }
+      }
+      selectI2CChannel(0); // НАМЕРТВО ВОЗВРАЩАЕМ МУЛЬТИПЛЕКСОР НА СКОРОСТНОЙ КАНАЛ 0 (ADS1115)
+  }
+  // =================================================================================
+
     // СТРОГО ОБНОВЛЕНО ПО ТЗ: АВТОНОМНЫЙ ASCII ПАРСЕР ЧАСТОТЫ FT-450 (WOLF USB) БЕЗ ВНЕШНИХ ПЕРЕМЕННЫХ
   if (ext_protocol_type == 4) {
       static String ft450_local_buffer = ""; // Локальный защищенный буфер строки Yaesu
