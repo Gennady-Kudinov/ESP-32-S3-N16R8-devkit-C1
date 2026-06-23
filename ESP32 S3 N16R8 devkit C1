@@ -949,20 +949,23 @@ if (trxLabel) {
     if (segVd > 16) segVd = 16; if (segVd < 0) segVd = 0;
     fillMiniBar('mb-vd', segVd, '#00ff66');
     
+       // ОБНОВЛЕНО: Расширенный массив под 7 протоколов (индексы 0..6)
     let pType = parseInt(parts[13]);
     let pNames = [
-    "PROT: PCNT (Counter)", 
-    "PROT: EXPERT TCI", 
-    "PROT: WOLF CAT", 
-    "PROT: ICOM CI-V", 
-    "PROT: YAESU CAT / FT-450", 
-    "PROT: KENWOOD CAT"
-  ];
+      "PROT: PCNT (Counter)", 
+      "PROT: EXPERT TCI", 
+      "PROT: WOLF CAT", 
+      "PROT: ICOM CI-V", 
+      "PROT: YAESU CAT / FT-450", 
+      "PROT: KENWOOD CAT",
+      "PROT: YAESU ABCD DATA" // Индекс 6 — Наш новый аппаратный протокол!
+    ];
 
- let activeName = (pType >= 0 && pType <= 5) ? pNames[pType] : "PROT: UNKNOWN";
+    // ИСПРАВЛЕНО: Лимит увеличен до 6, чтобы JavaScript не зависал при выборе Yaesu ABCD
+    let activeName = (pType >= 0 && pType <= 6) ? pNames[pType] : "PROT: UNKNOWN";
 
- // Выводим имя протокола в синее окно на Главном экране
- document.getElementById('ext-proto').innerText = activeName;
+    // Выводим имя протокола в синее окно на Главном экране
+    document.getElementById('ext-proto').innerText = activeName;
 
     let fanPwm = parseInt(parts[14]) || 0;
     document.getElementById('val-fan-pwm').innerText = fanPwm + '%';
@@ -1612,9 +1615,9 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
         <option value='3'>3 - ICOM CI-V PROTOCOL (REMOTE BUS)</option>
         <option value='4'>4 - YAESU CAT PROTOCOL (4800-38400 BPS)</option>
         <option value='5'>5 - KENWOOD CAT PROTOCOL (TS-SERIES)</option>
+        <option value='6'>6 - YAESU ABCD BAND DATA (MCP23017)</option> 
       </select>
     </div>
-
 
     <div style='text-align:left; width:85%; max-width:400px; margin:0 auto 20px auto;'>
       <div style='font-size:0.75rem; color:#4a86e8; font-weight:bold; margin-bottom:5px; letter-spacing:1px;'>TCI SERVER (Tetis / ExpertSDR)</div>
@@ -2077,19 +2080,27 @@ void setup() {
   Wire.write(0x02); // Включаем Pull-Up резистор строго на Бит 1 (ножка 22, GPA1, Кнопка RESET)
   Wire.endTransmission();
 
+//==
+  // --- СТРОГО ОБНОВЛЕНО ПО ТЗ: ОПРЕДЕЛЕНИЕ И ПОДТЯЖКА ДЛЯ ВХОДОВ BAND DATA ABCD (ЯДРО YAESU) ---
   Wire.beginTransmission(MCP_ADDR);
   Wire.write(IODIRB);
-  // Маска 0x03 (00000011 в двоичном): 
-  // Бит 0 (ножка 1, GPB0, Вход PTT1) -> 1 (Вход)
-  // Бит 1 (ножка 2, GPB1, Вход PTT2) -> 1 (Вход)
-  // Бит 6 (ножка 7, GPB6, Выход Реле2) и Бит 7 (ножка 8, GPB7, Выход Реле1) -> 0 (Выходы)
-  Wire.write(0x03); 
+  // Новая маска 0x3F (в двоичном коде это 00111111):
+  // Бит 0 (ножка 1, GPB0) -> 1 (Вход PTT1)
+  // Бит 1 (ножка 2, GPB1) -> 1 (Вход PTT2)
+  // Бит 2 (ножка 3, GPB2) -> 1 (Вход BAND A) строго по ТЗ!
+  // Бит 3 (ножка 4, GPB3) -> 1 (Вход BAND B) строго по ТЗ!
+  // Бит 4 (ножка 5, GPB4) -> 1 (Вход BAND C) строго по ТЗ!
+  // Бит 5 (ножка 6, GPB5) -> 1 (Вход BAND D) строго по ТЗ!
+  // Биты 6 и 7 (ножки 7 и 8, реле TRX) -> остаются в 0 (Выходы)
+  Wire.write(0x3F); 
   Wire.endTransmission();
 
   Wire.beginTransmission(MCP_ADDR);
   Wire.write(GPPUB);
-  Wire.write(0x03); // Включаем Pull-Up резисторы на Бит 0 (ножка 1) и Бит 1 (ножка 2)
+  // Маска 0x3F включает встроенные Pull-Up резисторы подтяжки на все входы одновременно (биты 0, 1, 2, 3, 4, 5)
+  Wire.write(0x3F); 
   Wire.endTransmission();
+//==
 
   // СТАРТОВАЯ ИНИЦИАЛИЗАЦИЯ: По умолчанию включаем Реле 1 (ножка 8 / GPB7)
   Wire.beginTransmission(MCP_ADDR);
@@ -2595,7 +2606,68 @@ void loop() {
       }
   }
   
-//===
+  // =================================================================================
+  // СТРОГО ДОБАВЛЕНО ПО ТЗ: ДЕШИФРАТОР СИГНАЛОВ BAND DATA YAESU ABCD (ПРОТОКОЛ №6)
+  // Опрашивает MCP23017 каждые 20 мс, считывает код и мгновенно включает ФНЧ по таблице
+  // =================================================================================
+  static unsigned long lastAbcdCheckTimer = 0;
+  if (ext_protocol_type == 6 && (millis() - lastAbcdCheckTimer >= 20)) {
+      lastAbcdCheckTimer = millis();
+      
+      selectI2CChannel(1); // Заглядываем на шину MCP23017
+      Wire.beginTransmission(MCP_ADDR);
+      Wire.write(0x13); // Читаем регистр физического состояния Порта B (GPIOB)
+      if (Wire.endTransmission() == 0) {
+          Wire.requestFrom(MCP_ADDR, 1);
+          if (Wire.available()) {
+              uint8_t portB = Wire.read();
+              
+              // Выделяем биты 2, 3, 4, 5 (сдвигаем их вправо, чтобы получить чистые 4 бита ABCD)
+              // Инвертируем (!), так как при высоком уровне Yaesu (+5V/3.3V) Pull-Up MCP закроется в 0
+              uint8_t rawA = ((portB & (1 << 2)) == 0) ? 1 : 0;
+              uint8_t rawB = ((portB & (1 << 3)) == 0) ? 1 : 0;
+              uint8_t rawC = ((portB & (1 << 4)) == 0) ? 1 : 0;
+              uint8_t rawD = ((portB & (1 << 5)) == 0) ? 1 : 0;
+              
+              // Собираем двоичное HEX-число: D-C-B-A
+              uint8_t hexCode = (rawD << 3) | (rawC << 2) | (rawB << 1) | rawA;
+              
+              static uint8_t lastHexCode = 0xFF;
+              if (hexCode != lastHexCode && hexCode > 0) {
+                  lastHexCode = hexCode;
+                  
+                  double targetFreqHz = 0.0;
+                  
+                  // СНАЙПЕРСКАЯ СВЕРКА С ТАБЛИЦЕЙ НА ФОТОГРАФИИ:
+                  switch (hexCode) {
+                      case 0x01: targetFreqHz = 1800000.0;  break; // HEX 1 -> 160м
+                      case 0x02: targetFreqHz = 3500000.0;  break; // HEX 2 -> 80м
+                      case 0x03: targetFreqHz = 7000000.0;  break; // HEX 3 -> 40м
+                      case 0x04: targetFreqHz = 10000000.0; break; // HEX 4 -> 30м
+                      case 0x05: targetFreqHz = 14000000.0; break; // HEX 5 -> 14МГц (20м)
+                      case 0x06: targetFreqHz = 18000000.0; break; // HEX 6 -> 17м
+                      case 0x07: targetFreqHz = 21000000.0; break; // HEX 7 -> 15м
+                      case 0x08: targetFreqHz = 24000000.0; break; // HEX 8 -> 12м
+                      case 0x09: targetFreqHz = 28000000.0; break; // HEX 9 -> 10м
+                      case 0x0A: targetFreqHz = 50000000.0; break; // HEX A -> 6м
+                      default: targetFreqHz = 0.0; break; // Неизвестная комбинация
+                  }
+                  
+                  if (targetFreqHz > 0.0) {
+                      final_frequency = (uint32_t)targetFreqHz;
+                      
+                      // Мгновенно вызываем вашу проверенную автопривязку ФНЧ и Антенн!
+                      autoSelectBand(targetFreqHz);
+                      
+                      Serial0.printf("Yaesu ABCD: Логика сработала! HEX: %X | Выбран ФНЧ: %s\n", 
+                                     hexCode, current_band_name.c_str());
+                  }
+              }
+          }
+      }
+      selectI2CChannel(0); // Обязательно возвращаем мультиплексор на Канал 0 (ADS1115 датчиков)
+  }
+
   // --- ОБНОВЛЕНО: КОНЕЧНЫЙ АВТОМАТ ОДНОКРАТНОГО ЗАМЕРА ЧАСТОТЫ ФНЧ ПРИ СТАРТЕ TX ---
   if (ext_protocol_type == 0) {
       bool current_ptt = (active_trx_id == 2) ? ptt2_active : ptt1_active;
@@ -2727,7 +2799,7 @@ void loop() {
 
       lcd.setCursor(0, 1);
       float max_scale_power = lim_pout;
-      if (max_scale_power <= 0.0f) max_scale_power = 1500.0f;
+      if (max_scale_power <= 0.0f) max_scale_power = 1000.0f;
       int total_segments = 0;
       if (wattsFwd > 1.0f) {
           total_segments = (int)((wattsFwd / max_scale_power) * 16.0f);
