@@ -1508,7 +1508,7 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
       
       <!-- Сетка 2х2 интерактивных объемных кнопок выбора антенн -->
       <div style='display:grid; grid-template-columns: 1fr 1fr; gap:15px; width:90%; max-width:400px; margin:0 auto;'>
-        <!-- Антенна 1 (По умолчанию активна, рамка оранжевая Icom) -->
+       <!-- Антенна 1 (По умолчанию активна, рамка оранжевая Icom) -->
         <div id='btn-ant1' onclick='clickAnt(1, "MAIN BEAM")' style='background:linear-gradient(145deg, #111319, #08090d); border:2px solid #ff9900; border-radius:6px; padding:15px 5px; color:#fff; cursor:pointer; font-family:monospace;'>
           <div style='font-weight:bold; font-size:1.1rem; color:#ff9900;'>ANT 1</div>
           <div style='font-size:0.6rem; color:#8e8e9f; margin-top:4px;'>50 OHM MAIN</div>
@@ -1541,31 +1541,31 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
       <div style='display:flex; flex-direction:column; gap:6px; width:90%; max-width:400px; margin:0 auto;'>
         <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
           <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>160m</span>
-          <select id='bmap-0' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+          <select id='bmap-0' class='time-input' style='width:100%; color:#00ff66; text-align:center;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
         </div>
         <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
           <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>80m</span>
-          <select id='bmap-1' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+          <select id='bmap-1' class='time-input' style='width:100%; color:#00ff66; text-align:center;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
         </div>
         <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
           <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>40m</span>
-          <select id='bmap-2' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+          <select id='bmap-2' class='time-input' style='width:100%; color:#00ff66; text-align:center;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
         </div>
         <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
           <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>20m/30m</span>
-          <select id='bmap-3' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+          <select id='bmap-3' class='time-input' style='width:100%; color:#00ff66; text-align:center;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
         </div>
         <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
           <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>17m/12m</span>
-          <select id='bmap-4' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+          <select id='bmap-4' class='time-input' style='width:100%; color:#00ff66; text-align:center;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
         </div>
         <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
           <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>12m/10m</span>
-          <select id='bmap-5' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+          <select id='bmap-5' class='time-input' style='width:100%; color:#00ff66; text-align:center;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
         </div>
         <div style='display:grid; grid-template-columns:1fr 80px; gap:8px; align-items:center;'>
           <span style='font-size:0.7rem; color:#a2a4ad; font-family:monospace; text-align:left;'>6m</span>
-          <select id='bmap-6' class='time-input' style='width:100%;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
+          <select id='bmap-6' class='time-input' style='width:100%; color:#00ff66; text-align:center;'><option value='1'>ANT 1</option><option value='2'>ANT 2</option><option value='3'>ANT 3</option><option value='4'>ANT 4</option></select>
         </div>
       </div>
       <div id='ant-map-msg' style='color:#00ff66; font-size:0.7rem; font-family:monospace; margin-top:12px;'></div>
@@ -1613,7 +1613,7 @@ const char HTML_BODY_NEW[] PROGMEM = R"rawliteral(
         <option value='1'>1 - EXPERT ELECTRONICS TCI (WI-FI / Tetis)</option>
         <option value='2'>2 - DDC/DUC WOLF CAT (TS-2000 VIA USB)</option>
         <option value='3'>3 - ICOM CI-V PROTOCOL (REMOTE BUS)</option>
-        <option value='4'>4 - YAESU CAT PROTOCOL (4800-38400 BPS)</option>
+        <option value='4'>4 - YAESU FT450</option>
         <option value='5'>5 - KENWOOD CAT PROTOCOL (TS-SERIES)</option>
         <option value='6'>6 - YAESU ABCD BAND DATA (MCP23017)</option> 
       </select>
@@ -2348,11 +2348,18 @@ void loop() {
       }
       selectI2CChannel(0); // НАМЕРТВО ВОЗВРАЩАЕМ МУЛЬТИПЛЕКСОР НА СКОРОСТНОЙ КАНАЛ 0 (ADS1115)
   }
-  // =================================================================================
-
+ 
     // ОБНОВЛЕНО: АВТОНОМНЫЙ ASCII ПАРСЕР ЧАСТОТЫ FT-450 (WOLF USB) БЕЗ ВНЕШНИХ ПЕРЕМЕННЫХ
   if (ext_protocol_type == 4) {
       static String ft450_local_buffer = ""; // Локальный защищенный буфер строки Yaesu
+
+      // ДОБАВЛЕНО: Асинхронный опрос трансивера Yaesu (запрос частоты раз в 250 мс)
+      static unsigned long lastFt450Query = 0;
+      if (millis() - lastFt450Query >= 250) {
+          lastFt450Query = millis();
+          // Посылаем в Yaesu команду-просьбу "Скажи частоту VFO-A" строго по даташиту!
+          Serial2.print("FA;"); 
+      }
       
       while (Serial2.available()) {
           char c = Serial2.read();
@@ -2375,7 +2382,7 @@ void loop() {
           }
       }
   }
-  //==============================
+
   server.handleClient();
   tciService();
   
