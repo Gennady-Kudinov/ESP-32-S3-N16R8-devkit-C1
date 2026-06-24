@@ -2226,10 +2226,12 @@ void setup() {
       if (saved_baud_idx == 3) target_baud = 38400;
       if (saved_baud_idx == 4) target_baud = 115200;
       
-      // Инициализируем Serial2. Пины: RX на GPIO 16, TX на GPIO 15
-      Serial2.begin(target_baud, SERIAL_8N1, 16, 15);
-      Serial0.println("CAT Link: Порт Serial2 успешно запущен для FT-450 / WOLF USB.");
+      // СТРОГО ОБНОВЛЕНО: Перенос пинов CAT-интерфейса Yaesu FT-450 / WOLF
+      // Теперь: Сигнал RX подключен к GPIO 26, а сигнал TX подключен к GPIO 25!
+      Serial2.begin(target_baud, SERIAL_8N1, 26, 25);
+      Serial0.println("CAT Link: Порт Serial2 успешно перенесен на GPIO 26 (RX) и GPIO 25 (TX).");
   }
+  
   //==================
   server.on("/reset_trip", HTTP_GET, handleResetTrip);
   server.on("/save_ext_proto", HTTP_GET, handleSaveExtProto);
@@ -2350,17 +2352,24 @@ void loop() {
   }
  
     // ОБНОВЛЕНО: АВТОНОМНЫЙ ASCII ПАРСЕР ЧАСТОТЫ FT-450 (WOLF USB) БЕЗ ВНЕШНИХ ПЕРЕМЕННЫХ
+  // --- АВТОНОМНЫЙ ASCII ПАРСЕР ЧАСТОТЫ FT-450 (WOLF USB) С АКТИВНЫМ ЗАПРОСОМ VFO-A ---
   if (ext_protocol_type == 4) {
       static String ft450_local_buffer = ""; // Локальный защищенный буфер строки Yaesu
-
-      // ДОБАВЛЕНО: Асинхронный опрос трансивера Yaesu (запрос частоты раз в 250 мс)
+      
+      // СТРОГО ОБНОВЛЕНО: Асинхронный опрос трансивера Yaesu (запрос частоты раз в 250 мс)
       static unsigned long lastFt450Query = 0;
       if (millis() - lastFt450Query >= 250) {
           lastFt450Query = millis();
-          // Посылаем в Yaesu команду-просьбу "Скажи частоту VFO-A" строго по даташиту!
-          Serial2.print("FA;"); 
+          
+          // Берём живое состояние педали PTT активного трансивера
+          bool current_ptt = (active_trx_id == 2) ? ptt2_active : ptt1_active;
+          
+          // СТРОЖАЙШАЯ ЗАЩИТА: Посылаем запрос в Yaesu только если педаль ОТПУЩЕНА (режим RX)!
+          if (current_ptt == false) { 
+              Serial2.print("FA;"); 
+          }
       }
-      
+      // Дальше без изменений идет ваш кристально чистый оригинальный парсер ответа:
       while (Serial2.available()) {
           char c = Serial2.read();
           if (c == ';') { // Конец команды долетел
