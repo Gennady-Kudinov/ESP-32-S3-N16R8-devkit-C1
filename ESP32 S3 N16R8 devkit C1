@@ -1714,7 +1714,7 @@ String makeSliderCard(String name, String range, String id, float currentVal, fl
   s += makeSliderCard("Порог КСВ", "2.0 - 4.0", "sl-swr", lim_swr, 2, 4, 0.1f);
   s += makeSliderCard("Входная Pin", "1W - 140W", "sl-pin", lim_pin, 1, 140, 1.0f);
   s += makeSliderCard("Выходная FWD", "200W - 2500W", "sl-pout", lim_pout, 200, 2500, 50.0f);
-  s += makeSliderCard("Отраженная REF", "10W - 300W", "sl-pref", lim_pref, 10, 300, 5.0f);
+  s += makeSliderCard("Отраженная REF", "10W - 600W", "sl-pref", lim_pref, 10, 600, 5.0f);
   s += makeSliderCard("Ток ФНЧ (LPF)", "0A - 30A", "sl-lpf", lim_lpf, 0, 30, 1.0f);
   s += makeSliderCard("Таймаут TX", "0s - 60s", "sl-txtime", lim_tx_time, 0, 60, 1.0f);
   s += makeSliderCard("Температура", "30C - 75C", "sl-temp", lim_temp, 30, 75, 1.0f);
@@ -2043,8 +2043,14 @@ void handleUpdateUpload() {
 }
 
 void setup() {
-  Serial0.begin(115200); 
-  Serial1.begin(115200, SERIAL_8N1, 18, 17); // Скоростной порт UART1 для Nextion
+  // =================================================================================
+  // ОБНОВЛЕНО ПО: СТАРТ СКОРОСТНОГО UART ПОРТА ДЛЯ NEXTION 7"
+  // Официальный синтаксис ядра 3.x. Назначение: RX на GPIO 44, TX на GPIO 43!
+  // =================================================================================
+  Serial1.begin(115200, SERIAL_8N1, 44, 43);
+  Serial0.println("System: Порт Serial1 для дисплея Nextion запущен (Пины: RX=44, TX=43, 115200 Bps)");
+  // =================================================================================
+
   pinMode(18, OUTPUT);
   digitalWrite(18, HIGH); // По умолчанию подаем HIGH — усилитель разрешен к работе
   tempSensor.begin();
@@ -2211,28 +2217,29 @@ void setup() {
   corr_offset_temp = prefs.getFloat("c_temp", 0.0f);
   prefs.end();
 
-  //==================
   // ДОБАВЛЕНО: Локальный запуск порта Serial2 для FT-450 (WOLF) по USB
+  // =================================================================================
+  // СТРОГО ОБНОВЛЕНО ПО ТЗ: БЕЗУСЛОВНЫЙ СТАРТ ПОРТА SERIAL2 НА ПИНАХ 26 (RX) И 25 (TX)
+  // Адаптировано под синтаксис ядра Arduino ESP32 3.x для гарантированного пуска
+  // =================================================================================
+  long target_baud = 9600; // Базовая скорость обмена Yaesu по умолчанию
+  
+  // Читаем индекс скорости, если он сохранен в памяти, иначе берем 9600
   prefs.begin("усилитель", true);
-  int current_proto = prefs.getInt("ext_prot", 0);
   int saved_baud_idx = prefs.getInt("ext_baud", 1);
   prefs.end();
-
-  if (current_proto == 4) { // Если в меню выбран профиль FT-450 / WOLF USB
-      long target_baud = 9600;
-      if (saved_baud_idx == 0) target_baud = 4800;
-      if (saved_baud_idx == 1) target_baud = 9600;
-      if (saved_baud_idx == 2) target_baud = 19200;
-      if (saved_baud_idx == 3) target_baud = 38400;
-      if (saved_baud_idx == 4) target_baud = 115200;
-      
-      // СТРОГО ОБНОВЛЕНО: Перенос пинов CAT-интерфейса Yaesu FT-450 / WOLF
-      // Теперь: Сигнал RX подключен к GPIO 26, а сигнал TX подключен к GPIO 25!
-      Serial2.begin(target_baud, SERIAL_8N1, 26, 25);
-      Serial0.println("CAT Link: Порт Serial2 успешно перенесен на GPIO 26 (RX) и GPIO 25 (TX).");
-  }
   
-  //==================
+  if (saved_baud_idx == 0) target_baud = 4800;
+  if (saved_baud_idx == 1) target_baud = 9600;
+  if (saved_baud_idx == 2) target_baud = 19200;
+  if (saved_baud_idx == 3) target_baud = 38400;
+  if (saved_baud_idx == 4) target_baud = 115200;
+  
+  // Официальный синтаксис ядра 3.x: begin(baud, config, rxPin, txPin)
+  // Указываем: RX на GPIO 20, TX на GPIO 19
+  Serial2.begin(target_baud, SERIAL_8N1, 20, 19);
+  Serial0.printf("CAT Link: Аппаратный порт Serial2 безусловно запущен. Скорость: %ld Bps. Пины: 20 (RX), 19 (TX)\n", target_baud);
+
   server.on("/reset_trip", HTTP_GET, handleResetTrip);
   server.on("/save_ext_proto", HTTP_GET, handleSaveExtProto);
   server.on("/save_tci", HTTP_GET, handleSaveTciSettings);
@@ -2308,7 +2315,6 @@ void setup() {
 }
 
 void loop() {
-
   // =================================================================================
   // ДОБАВЛЕНО: ОПРОС ФИЗИЧЕСКОЙ КНОПКИ СБРОСА АВАРИИ (22-я НОЖКА / GPA1 MCP23017)
   // Опрашивает расширитель портов раз в 30 мс и строго в момент аварии, защищая loop()
@@ -2774,7 +2780,9 @@ void loop() {
       }
   }
 
-//===
+  // =================================================================================
+  // ЧАСТЬ 7: СИСТЕМНЫЙ КЛИМАТ, ИЗМЕРИТЕЛЬНЫЙ LCD 1602 И АСИНХРОННЫЙ МОТОР NEXTION 7"
+  // =================================================================================
 
   // --- АВТОМАТИЧЕСКИЙ РАСЧЕТ И УПРАВЛЕНИЕ ШИМ ВЕНТИЛЯТОРА (DEVKIT ПИН 14) ---
   static unsigned long lastFanControlTimer = 0;
@@ -2799,11 +2807,11 @@ void loop() {
       ledcWrite(14, pwmDuty); // Физически выдаем ШИМ на вывод 14 платы DevKit
   }
 
-        // ОБНОВЛЕНО: двухстрочный вывод на LCD 1602 — обновление не чаще 100 мс (снижение нагрузки на loop)
-    static unsigned long lastLcdUpdate = 0;
-    static int lastLcdWatts = -1;
-    int curWatts = (int)wattsFwd;
-    if (millis() - lastLcdUpdate >= 100 || abs(curWatts - lastLcdWatts) >= 3) {
+  // ОБНОВЛЕНО: двухстрочный вывод на LCD 1602 — обновление не чаще 100 мс (снижение нагрузки на loop)
+  static unsigned long lastLcdUpdate = 0;
+  static int lastLcdWatts = -1;
+  int curWatts = (int)wattsFwd;
+  if (millis() - lastLcdUpdate >= 100 || abs(curWatts - lastLcdWatts) >= 3) {
       lastLcdUpdate = millis();
       lastLcdWatts = curWatts;
 
@@ -2825,5 +2833,83 @@ void loop() {
           if (i < total_segments) lcd.write(0);
           else lcd.print(' ');
       }
+  }
+
+  // =================================================================================
+  // ДОБАВЛЕНО: АСИНХРОННЫЙ МОТОР ПОТОКОВОЙ ТЕЛЕМЕТРИИ ДЛЯ NEXTION 7"
+  // Выполняет обновление графики каждые 150 мс, гарантируя отсутствие мерцания экрана
+  // =================================================================================
+  static unsigned long lastNextionUpdate = 0;
+  if (millis() - lastNextionUpdate >= 150) {
+      lastNextionUpdate = millis();
+      
+      // 1. Форматируем и отправляем КВ-частоту и диапазон
+      double current_mhz = (double)final_frequency / 1000000.0;
+      String freq_string = (current_mhz > 0) ? String(current_mhz, 6) + " MHz" : "0.000000 MHz";
+      sendToNextion("tFreq", freq_string, true);
+      sendToNextion("tBand", current_band_name + " BAND", true);
+      
+      // 2. Отправляем параметры вольтметра стоков Vd
+      sendToNextion("tVd", String(ext_voltage_vd, 1) + " V", true);
+      int pctVd = (int)constrain((ext_voltage_vd / 60.0f) * 100.0f, 0, 100);
+      sendToNextion("jVd", String(pctVd), false);
+      
+      // 3. Отправляем параметры амперметра Id
+      sendToNextion("tId", String(ext_current_id, 2) + " A", true);
+      int pctId = (int)constrain((ext_current_id / 35.0f) * 100.0f, 0, 100);
+      sendToNextion("jId", String(pctId), false);
+      
+      // 4. Отправляем параметры термометра ЛДМОС
+      if (ext_temperature <= -127.0f) {
+          sendToNextion("tTemp", "ERR", true);
+          sendToNextion("jTemp", "0", false);
+      } else {
+          sendToNextion("tTemp", String(ext_temperature, 1) + " C", true);
+          int pctTemp = (int)constrain(((ext_temperature - 25.0f) / 50.0f) * 100.0f, 0, 100);
+          sendToNextion("jTemp", String(pctTemp), false);
+      }
+      
+      // 5. Отправляем мощность раскачки P IN
+      sendToNextion("tPin", String(wattsPin, 1) + " W", true);
+      int pctPin = (int)constrain((wattsPin / 100.0f) * 100.0f, 0, 100);
+      sendToNextion("jPin", String(pctPin), false);
+      
+      // 6. Отправляем климат вентилятора и статус педали TRX
+      sendToNextion("tFan", String(fan_pwm_percent) + "%", true);
+      sendToNextion("tTrx", "TRX-" + String(active_trx_id), true);
+      
+      // 7. Отправляем статус активного протокола связи
+      String pNames[] = {"PCNT COUNTER", "EXPERT TCI", "WOLF CAT", "ICOM CI-V", "YAESU FT-450", "KENWOOD CAT", "YAESU ABCD"};
+      String actName = (ext_protocol_type >= 0 && ext_protocol_type <= 6) ? pNames[ext_protocol_type] : "UNKNOWN";
+      sendToNextion("tProt", "PROT: " + actName, true);
+      
+      // 8. Отправляем скоростные шкалы приборов (Po, Pr, SWR) из быстрого буфера
+      int barFwd = (int)constrain((wattsFwd / 1200.0f) * 100.0f, 0, 100);
+      sendToNextion("jFwd", String(barFwd), false);
+      
+      int barRef = (int)constrain((wattsRef / 100.0f) * 100.0f, 0, 100);
+      sendToNextion("jRef", String(barRef), false);
+      
+      int barSwr = (int)constrain(((swr - 1.0f) / 4.0f) * 100.0f, 0, 100); // Шкала КСВ от 1.0 до 5.0
+      sendToNextion("jSwr", String(barSwr), false);
+  }
+
+} // <<< ЭТА ФИГУРНАЯ СКОБКА НАМЕРТВО И АРХИТЕКТУРНО ПРАВИЛЬНО ЗАКРЫВАЕТ ФУНКЦИЮ void loop()!
+
+// =================================================================================
+// СТРОГО ВЫНЕСЕНО В ГЛОБАЛЬНОЕ ПРОСТРАНСТВО ПО ЗАКОНАМ С++: ФУНКЦИЯ ОТПРАВКИ NEXTION
+// Находится за пределами loop(). Скорость порта UART1: 115200 Bps
+// =================================================================================
+void sendToNextion(String objName, String valStr, bool isText) {
+    if (isText) {
+        // Текстовая команда имеет синтаксис: objName.txt="valStr"
+        Serial1.print(objName + ".txt=\"" + valStr + "\"");
+    } else {
+        // Числовая команда имеет синтаксис: objName.val=valStr
+        Serial1.print(objName + ".val=" + valStr);
     }
+    // Отправляем три обязательных байта терминатора Nextion
+    Serial1.write(0xFF);
+    Serial1.write(0xFF);
+    Serial1.write(0xFF);
 }
